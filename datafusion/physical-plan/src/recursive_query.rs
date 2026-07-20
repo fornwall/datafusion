@@ -248,7 +248,7 @@ impl DisplayAs for RecursiveQueryExec {
 ///    buffer.push(batch)
 ///    yield buffer
 ///
-/// while buffer.len() > 0:
+/// loop:
 ///    sender, receiver = Channel()
 ///    register_continuation(handle_name, receiver)
 ///    sender.send(buffer.drain())
@@ -256,6 +256,13 @@ impl DisplayAs for RecursiveQueryExec {
 ///    while batch := recursive_stream.next():
 ///        buffer.append(batch)
 ///        yield buffer
+///    if buffer.len() == 0:
+///        break
+///
+/// Note that the recursive term runs at least once even when the static term
+/// produces no rows: it may produce rows from an empty work table (e.g. via
+/// an aggregate or outer join), so recursion only ends when an executed
+/// recursive term produces no rows.
 struct RecursiveQueryStream {
     /// The context to be used for managing handlers & executing new tasks
     task_context: Arc<TaskContext>,
@@ -274,6 +281,8 @@ struct RecursiveQueryStream {
     /// In-memory buffer for storing a copy of the current results. Will be
     /// cleared after each iteration.
     buffer: Vec<RecordBatch>,
+    /// True until the recursive term has been executed for the first time.
+    first_iteration: bool,
     /// Tracks the memory used by the buffer
     reservation: MemoryReservation,
     /// If the distinct flag is set, then we use this hash table to remove duplicates from result and work tables
@@ -306,6 +315,7 @@ impl RecursiveQueryStream {
             recursive_stream: None,
             schema,
             buffer: vec![],
+            first_iteration: true,
             reservation,
             distinct_deduplicator,
             baseline_metrics,
@@ -345,9 +355,13 @@ impl RecursiveQueryStream {
             .iter()
             .fold(0, |acc, batch| acc + batch.num_rows());
 
-        if total_length == 0 {
+        // Recursion ends when an executed recursive term produces no rows.
+        // The first iteration always runs: the recursive term may produce
+        // rows even when the static term produced none.
+        if total_length == 0 && !self.first_iteration {
             return Poll::Ready(None);
         }
+        self.first_iteration = false;
 
         // Update the work table with the current buffer
         let reserved_batches = ReservedBatches::new(
