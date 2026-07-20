@@ -29,6 +29,7 @@ use crate::{PhysicalExpr, PhysicalExprRef, PhysicalSortExpr, PhysicalSortRequire
 
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{JoinType, Result, ScalarValue};
+use datafusion_expr_common::sort_properties::SortProperties;
 use datafusion_physical_expr_common::physical_expr::format_physical_expr_list;
 
 use indexmap::{IndexMap, IndexSet};
@@ -760,7 +761,13 @@ impl EquivalenceGroup {
         //       expression `3 + 5`, not an unknown `heterogenous` value.
         let children = expr.children();
         if children.is_empty() {
-            return None;
+            // A leaf expression declaring a `Singleton` ordering evaluates to
+            // a single value regardless of input (e.g. an uncorrelated scalar
+            // subquery), so it is a constant whose value is unknown during
+            // planning.
+            let properties = expr.get_properties(&[]).ok()?;
+            return (properties.sort_properties == SortProperties::Singleton)
+                .then_some(AcrossPartitions::Uniform(None));
         }
         for child in children {
             self.is_expr_constant(child)?;
@@ -1244,5 +1251,33 @@ mod tests {
         assert!(first_normalized.eq(&second_normalized));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_is_expr_constant_singleton_leaf() {
+        use crate::scalar_subquery::ScalarSubqueryExpr;
+        use datafusion_expr::physical_planning_context::{
+            ScalarSubqueryResults, SubqueryIndex,
+        };
+
+        let group = EquivalenceGroup::default();
+
+        // A leaf expression that always evaluates to a single value (here, an
+        // uncorrelated scalar subquery) is a uniform constant whose value is
+        // unknown during planning.
+        let subquery: Arc<dyn PhysicalExpr> = Arc::new(ScalarSubqueryExpr::new(
+            DataType::Int32,
+            false,
+            SubqueryIndex::new(0),
+            ScalarSubqueryResults::new(1),
+        ));
+        assert_eq!(
+            group.is_expr_constant(&subquery),
+            Some(AcrossPartitions::Uniform(None))
+        );
+
+        // Columns are not constants.
+        let column: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+        assert_eq!(group.is_expr_constant(&column), None);
     }
 }
