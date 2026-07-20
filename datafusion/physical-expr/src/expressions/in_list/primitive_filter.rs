@@ -141,6 +141,13 @@ impl BitmapFilterType for Float16Type {
 
     #[inline(always)]
     fn index(value: Self::Native) -> usize {
+        // Normalize -0.0 -> +0.0 so both zeros map to one bit, matching SQL
+        // equality.
+        let value = if value.to_bits() << 1 == 0 {
+            half::f16::from_bits(0)
+        } else {
+            value
+        };
         value.to_bits() as usize
     }
 }
@@ -222,8 +229,9 @@ where
     }
 }
 
-/// Wrapper for f32 that implements Hash and Eq using bit comparison.
-/// This treats NaN values as equal to each other when they have the same bit pattern.
+/// Wrapper for f32 that implements Hash and Eq using bit comparison of the
+/// normalized value: `-0.0` is folded into `+0.0` so both zeros compare equal
+/// (SQL equality). NaN values are equal when they have the same bit pattern.
 #[derive(Clone, Copy)]
 struct OrderedFloat32(f32);
 
@@ -243,12 +251,13 @@ impl Eq for OrderedFloat32 {}
 
 impl From<f32> for OrderedFloat32 {
     fn from(v: f32) -> Self {
-        Self(v)
+        if v == 0.0 { Self(0.0) } else { Self(v) }
     }
 }
 
-/// Wrapper for f64 that implements Hash and Eq using bit comparison.
-/// This treats NaN values as equal to each other when they have the same bit pattern.
+/// Wrapper for f64 that implements Hash and Eq using bit comparison of the
+/// normalized value: `-0.0` is folded into `+0.0` so both zeros compare equal
+/// (SQL equality). NaN values are equal when they have the same bit pattern.
 #[derive(Clone, Copy)]
 struct OrderedFloat64(f64);
 
@@ -268,7 +277,7 @@ impl Eq for OrderedFloat64 {}
 
 impl From<f64> for OrderedFloat64 {
     fn from(v: f64) -> Self {
-        Self(v)
+        if v == 0.0 { Self(0.0) } else { Self(v) }
     }
 }
 
@@ -564,9 +573,10 @@ mod tests {
             .slice(1, 4),
         );
         let filter = BitmapFilter::<Float16Type>::try_new(&haystack)?;
+        // `+0.0` matches the `-0.0` in the haystack after normalization
         let needles = Float16Array::from(vec![
-            Some(f16::from_f32(0.0)),
             Some(f16::from_f32(-0.0)),
+            Some(f16::from_f32(0.0)),
             Some(nan_a),
             Some(nan_b),
             None,
