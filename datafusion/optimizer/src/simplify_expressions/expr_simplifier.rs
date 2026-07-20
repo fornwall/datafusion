@@ -213,7 +213,7 @@ impl ExprSimplifier {
         let mut simplifier = Simplifier::new(&self.info);
         let config_options = Some(Arc::clone(self.info.config_options()));
         let mut const_evaluator = ConstEvaluator::try_new(config_options)?;
-        let mut shorten_in_list_simplifier = ShortenInListSimplifier::new();
+        let mut shorten_in_list_simplifier = ShortenInListSimplifier::new(&self.info);
         let guarantees_map: HashMap<&Expr, &NullableInterval> =
             self.guarantees.iter().map(|(k, v)| (k, v)).collect();
 
@@ -855,11 +855,15 @@ impl TreeNodeRewriter for Simplifier<'_> {
             // Both sides are the same expression (A = A) and A is non-volatile expression
             // A = A --> A IS NOT NULL OR NULL
             // A = A --> true (if A not nullable)
+            // Floats are excluded: NaN = NaN is false under IEEE 754.
             Expr::BinaryExpr(BinaryExpr {
                 left,
                 op: Eq,
                 right,
-            }) if (left == right) & !left.is_volatile() => {
+            }) if (left == right)
+                && !left.is_volatile()
+                && !info.get_data_type(&left)?.is_floating() =>
+            {
                 Transformed::yes(match !info.nullable(&left)? {
                     true => lit(true),
                     false => Expr::BinaryExpr(BinaryExpr {
@@ -2223,22 +2227,38 @@ fn are_inlist_and_eq(left: &Expr, right: &Expr) -> bool {
     }
 }
 
+/// Returns true for a float NaN literal. `expr = NaN` follows IEEE 754 and is
+/// never true, while `expr IN (NaN)` uses grouping equality and matches every
+/// NaN, so rewrites between `=` and `IN` must leave NaN literals alone.
+fn is_nan_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(ScalarValue::Float16(Some(v)), _) => v.is_nan(),
+        Expr::Literal(ScalarValue::Float32(Some(v)), _) => v.is_nan(),
+        Expr::Literal(ScalarValue::Float64(Some(v)), _) => v.is_nan(),
+        _ => false,
+    }
+}
+
 /// Try to convert an expression to an in-list expression
 fn as_inlist(expr: &'_ Expr) -> Option<Cow<'_, InList>> {
     match expr {
         Expr::InList(inlist) => Some(Cow::Borrowed(inlist)),
         Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::Eq => {
             match (left.as_ref(), right.as_ref()) {
-                (Expr::Column(_), Expr::Literal(_, _)) => Some(Cow::Owned(InList {
-                    expr: left.clone(),
-                    list: vec![*right.clone()],
-                    negated: false,
-                })),
-                (Expr::Literal(_, _), Expr::Column(_)) => Some(Cow::Owned(InList {
-                    expr: right.clone(),
-                    list: vec![*left.clone()],
-                    negated: false,
-                })),
+                (Expr::Column(_), Expr::Literal(_, _)) if !is_nan_literal(right) => {
+                    Some(Cow::Owned(InList {
+                        expr: left.clone(),
+                        list: vec![*right.clone()],
+                        negated: false,
+                    }))
+                }
+                (Expr::Literal(_, _), Expr::Column(_)) if !is_nan_literal(left) => {
+                    Some(Cow::Owned(InList {
+                        expr: right.clone(),
+                        list: vec![*left.clone()],
+                        negated: false,
+                    }))
+                }
                 _ => None,
             }
         }
@@ -2254,16 +2274,20 @@ fn to_inlist(expr: Expr) -> Option<InList> {
             op: Operator::Eq,
             right,
         }) => match (left.as_ref(), right.as_ref()) {
-            (Expr::Column(_), Expr::Literal(_, _)) => Some(InList {
-                expr: left,
-                list: vec![*right],
-                negated: false,
-            }),
-            (Expr::Literal(_, _), Expr::Column(_)) => Some(InList {
-                expr: right,
-                list: vec![*left],
-                negated: false,
-            }),
+            (Expr::Column(_), Expr::Literal(_, _)) if !is_nan_literal(&right) => {
+                Some(InList {
+                    expr: left,
+                    list: vec![*right],
+                    negated: false,
+                })
+            }
+            (Expr::Literal(_, _), Expr::Column(_)) if !is_nan_literal(&left) => {
+                Some(InList {
+                    expr: right,
+                    list: vec![*left],
+                    negated: false,
+                })
+            }
             _ => None,
         },
         _ => None,

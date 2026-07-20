@@ -23,16 +23,19 @@ use datafusion_common::Result;
 use datafusion_common::tree_node::{Transformed, TreeNodeRewriter};
 use datafusion_expr::Expr;
 use datafusion_expr::expr::InList;
+use datafusion_expr::simplify::SimplifyContext;
 
-pub(super) struct ShortenInListSimplifier {}
+pub(super) struct ShortenInListSimplifier<'a> {
+    info: &'a SimplifyContext,
+}
 
-impl ShortenInListSimplifier {
-    pub(super) fn new() -> Self {
-        Self {}
+impl<'a> ShortenInListSimplifier<'a> {
+    pub(super) fn new(info: &'a SimplifyContext) -> Self {
+        Self { info }
     }
 }
 
-impl TreeNodeRewriter for ShortenInListSimplifier {
+impl TreeNodeRewriter for ShortenInListSimplifier<'_> {
     type Node = Expr;
 
     fn f_up(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
@@ -53,6 +56,10 @@ impl TreeNodeRewriter for ShortenInListSimplifier {
                     || list.len() <= THRESHOLD_INLINE_INLIST
                         && expr.try_as_col().is_some()
             )
+            // Floats keep `IN` semantics: `IN` uses grouping equality where
+            // every NaN matches, while `=` follows IEEE 754 where NaN matches
+            // nothing.
+            && !matches!(self.info.get_data_type(expr), Ok(dt) if dt.is_floating())
         {
             let first_val = list[0].clone();
             if negated {
