@@ -191,3 +191,44 @@ b 5
 c 4
 d 1
 e 1
+
+
+# Keep sorting when a sort key is computed from an uncorrelated scalar
+# subquery: the subquery is a per-query constant, so the sort reduces to the
+# remaining keys instead of being dropped
+
+query TT
+EXPLAIN SELECT x FROM (SELECT x, (SELECT 1) AS k FROM (VALUES (3), (1), (2)) t(x)) sub ORDER BY k, x DESC
+----
+logical_plan
+01)Projection: sub.x
+02)--Sort: sub.k ASC NULLS LAST, sub.x DESC NULLS FIRST
+03)----SubqueryAlias: sub
+04)------Projection: t.x, (<subquery>) AS k
+05)--------Subquery:
+06)----------Projection: Int64(1)
+07)------------EmptyRelation: rows=1
+08)--------SubqueryAlias: t
+09)----------Projection: column1 AS x
+10)------------Values: (Int64(3)), (Int64(1)), (Int64(2))
+physical_plan
+01)ScalarSubqueryExec: subqueries=1
+02)--SortExec: expr=[x@0 DESC], preserve_partitioning=[false]
+03)----ProjectionExec: expr=[column1@0 as x]
+04)------DataSourceExec: partitions=1, partition_sizes=[1]
+05)--ProjectionExec: expr=[1 as Int64(1)]
+06)----PlaceholderRowExec
+
+query I
+SELECT x FROM (SELECT x, (SELECT 1) AS k FROM (VALUES (3), (1), (2)) t(x)) sub ORDER BY k, x DESC
+----
+3
+2
+1
+
+query I
+SELECT x FROM (VALUES (3), (1), (2)) t(x) ORDER BY x + (SELECT 0)
+----
+1
+2
+3
