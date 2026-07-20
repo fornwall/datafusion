@@ -253,10 +253,11 @@ pub fn check_subquery_expr(
             | LogicalPlan::TableScan(_)
             | LogicalPlan::Window(_)
             | LogicalPlan::Aggregate(_)
-            | LogicalPlan::Join(_) => Ok(()),
+            | LogicalPlan::Join(_)
+            | LogicalPlan::Sort(_) => Ok(()),
             _ => plan_err!(
                 "In/Exist/SetComparison subquery can only be used in \
-                Projection, Filter, TableScan, Window functions, Aggregate and Join plan nodes, \
+                Projection, Filter, TableScan, Window functions, Aggregate, Join and Sort plan nodes, \
                 but was used in [{}]",
                 outer_plan.display()
             ),
