@@ -15,16 +15,39 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# There is one logical float NaN: every NaN bit pattern compares equal and
-# groups together, as in PostgreSQL. `-CAST('NaN' AS DOUBLE)` flips the sign
-# bit, producing a NaN with a different bit pattern than the parsed literal.
+# Float NaN semantics. Comparison operators follow IEEE 754: any comparison
+# involving NaN is false, except != which is true. Grouping equality
+# (GROUP BY, DISTINCT, join keys, IN, IS [NOT] DISTINCT FROM) instead treats
+# every NaN as one value, regardless of bit pattern. `-CAST('NaN' AS DOUBLE)`
+# flips the sign bit, producing a NaN with a different bit pattern than the
+# parsed literal.
 
+query BBBBBB
+SELECT nan = nan, nan != nan, nan < 1.0, nan > 1.0, nan <= nan, nan >= nan
+FROM (SELECT CAST('NaN' AS DOUBLE) AS nan)
+----
+false true false false false false
+
+# The same column on both sides is not simplified to true
 query BB
-SELECT x = y, x IS NOT DISTINCT FROM y
+SELECT x = x, x != x FROM (VALUES (CAST('NaN' AS DOUBLE))) t(x)
+----
+false true
+
+# NaNs with different bit patterns
+query BB
+SELECT x = y, x != y
 FROM (VALUES (CAST('NaN' AS DOUBLE), -CAST('NaN' AS DOUBLE))) t(x, y)
 ----
-true true
+false true
 
+query BB
+SELECT x IS DISTINCT FROM y, x IS NOT DISTINCT FROM y
+FROM (VALUES (CAST('NaN' AS DOUBLE), -CAST('NaN' AS DOUBLE))) t(x, y)
+----
+false true
+
+# All NaN bit patterns are one group
 query I
 SELECT COUNT(*)
 FROM (
@@ -34,6 +57,7 @@ FROM (
 ----
 1
 
+# ...and so are -0.0 and +0.0
 query I
 SELECT COUNT(*)
 FROM (
@@ -42,14 +66,15 @@ FROM (
 ----
 2
 
-# The distinct-values accumulator agrees with GROUP BY
+# COUNT(DISTINCT ..) matches GROUP BY, also when the distinct-values
+# accumulator is used because of the mixed aggregates
 query II
 SELECT COUNT(DISTINCT x), COUNT(x)
 FROM (VALUES (0.0), (-0.0), (CAST('NaN' AS DOUBLE)), (-CAST('NaN' AS DOUBLE))) t(x)
 ----
 2 4
 
-# Join keys
+# Join keys use grouping equality
 query I
 SELECT COUNT(*)
 FROM (VALUES (CAST('NaN' AS DOUBLE))) a(x)
@@ -57,20 +82,40 @@ JOIN (VALUES (-CAST('NaN' AS DOUBLE))) b(y) ON x = y
 ----
 1
 
-# IN, both with a constant list (static filter) and non-constant list elements
-query BB
-SELECT CAST('NaN' AS DOUBLE) IN (-CAST('NaN' AS DOUBLE)),
-       x IN (1.0, 2.0, y)
+# IN uses grouping equality, both with a constant list (static filter) and
+# with non-constant list elements
+query BBB
+SELECT CAST('NaN' AS DOUBLE) IN (CAST('NaN' AS DOUBLE)),
+       CAST('NaN' AS DOUBLE) IN (-CAST('NaN' AS DOUBLE)),
+       0.0 IN (-0.0)
+----
+true true true
+
+query B
+SELECT x IN (1.0, 2.0, y)
 FROM (VALUES (CAST('NaN' AS DOUBLE), -CAST('NaN' AS DOUBLE))) t(x, y)
 ----
-true true
+true
+
+query B
+SELECT x NOT IN (CAST('NaN' AS DOUBLE))
+FROM (VALUES (-CAST('NaN' AS DOUBLE))) t(x)
+----
+false
+
+# An OR of = comparisons keeps IEEE semantics (it is not merged into IN)
+query B
+SELECT x = CAST('NaN' AS DOUBLE) OR x = 1.0
+FROM (VALUES (CAST('NaN' AS DOUBLE))) t(x)
+----
+false
 
 # The same semantics hold for REAL (Float32)
-query B
-SELECT x = y
+query BB
+SELECT x = x, x IN (y)
 FROM (VALUES (CAST('NaN' AS REAL), -CAST('NaN' AS REAL))) t(x, y)
 ----
-true
+false true
 
 query I
 SELECT COUNT(*)
