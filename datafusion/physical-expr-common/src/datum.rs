@@ -23,7 +23,7 @@ use arrow::compute::kernels::cmp::{
 };
 use arrow::compute::{SortOptions, ilike, like, nilike, nlike};
 use arrow::error::ArrowError;
-use datafusion_common::utils::{normalize_float_zero, normalize_float_zero_scalar};
+use datafusion_common::utils::{canonicalize_float_scalar, canonicalize_floats};
 use datafusion_common::{Result, ScalarValue};
 use datafusion_common::{arrow_datafusion_err, assert_or_internal_err, internal_err};
 use datafusion_expr_common::columnar_value::ColumnarValue;
@@ -86,20 +86,21 @@ pub fn apply_cmp(
         };
 
         // Arrow's comparison kernels use IEEE 754 totalOrder semantics for
-        // floats, which treats `-0.0` and `+0.0` as distinct. Normalize float
-        // operands so SQL semantics (`+0.0 == -0.0`) hold. No-op for
-        // non-float types.
-        let lhs = normalize_cmp_input(lhs);
-        let rhs = normalize_cmp_input(rhs);
+        // floats, which treats `-0.0` and `+0.0` as distinct and
+        // distinguishes NaN bit patterns. Canonicalize float operands so
+        // `+0.0 == -0.0` holds and every NaN compares as the same single
+        // value, as in PostgreSQL. No-op for non-float types.
+        let lhs = canonicalize_cmp_input(lhs);
+        let rhs = canonicalize_cmp_input(rhs);
         apply(&lhs, &rhs, |l, r| Ok(Arc::new(f(l, r)?)))
     }
 }
 
-fn normalize_cmp_input(cv: &ColumnarValue) -> ColumnarValue {
+fn canonicalize_cmp_input(cv: &ColumnarValue) -> ColumnarValue {
     match cv {
-        ColumnarValue::Array(a) => ColumnarValue::Array(normalize_float_zero(a)),
+        ColumnarValue::Array(a) => ColumnarValue::Array(canonicalize_floats(a)),
         ColumnarValue::Scalar(s) => {
-            ColumnarValue::Scalar(normalize_float_zero_scalar(s.clone()))
+            ColumnarValue::Scalar(canonicalize_float_scalar(s.clone()))
         }
     }
 }

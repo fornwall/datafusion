@@ -1378,21 +1378,22 @@ fn fsl_values_row_number(list_size: i32, array_len: usize) -> Result<Int32Array>
     Ok(PrimitiveArray::new(rows_number.into(), None))
 }
 
-/// Replace `-0.0` with `+0.0` in any `Float16`, `Float32`, or `Float64` array.
-/// For non-float arrays returns the input unchanged. NaN payloads are
-/// preserved.
+/// Replace `-0.0` with `+0.0` and every NaN with the canonical NaN in any
+/// `Float16`, `Float32`, or `Float64` array. For non-float arrays returns the
+/// input unchanged.
 ///
 /// Arrow's comparison kernels (`arrow::compute::kernels::cmp::eq` etc.) and
 /// row-encoding (`arrow::row::RowConverter`) use IEEE 754 totalOrder
-/// semantics, which treats `-0.0` and `+0.0` as distinct. SQL semantics
-/// (PostgreSQL / IEEE 754 equality) require them to compare equal, so
-/// callers normalize before invoking those kernels.
+/// semantics, which treats `-0.0` and `+0.0` as distinct and distinguishes
+/// NaN bit patterns. SQL grouping equality (GROUP BY, DISTINCT, join keys)
+/// requires `-0.0` and `+0.0` to be one group and all NaNs to be one group,
+/// so callers canonicalize before invoking those kernels.
 ///
-/// The common case - no `-0.0` present - is allocation-free: a single
-/// read-only scan of the underlying buffer (auto-vectorizable to an
-/// OR-reduction) decides whether to fall through to the rewriting path.
-/// Only arrays that actually contain `-0.0` pay for a new buffer.
-pub fn normalize_float_zero(array: &ArrayRef) -> ArrayRef {
+/// The common case - no `-0.0` or non-canonical NaN present - is
+/// allocation-free: a single read-only scan of the underlying buffer decides
+/// whether to fall through to the rewriting path. Only arrays that actually
+/// need rewriting pay for a new buffer.
+pub fn canonicalize_floats(array: &ArrayRef) -> ArrayRef {
     use arrow::array::{Float16Array, Float32Array, Float64Array};
     use arrow::datatypes::{Float16Type, Float32Type, Float64Type};
     // -0.0 has only the sign bit set; no other finite or NaN value shares
@@ -1400,68 +1401,93 @@ pub fn normalize_float_zero(array: &ArrayRef) -> ArrayRef {
     const NEG_ZERO_F16_BITS: u16 = half::f16::NEG_ZERO.to_bits();
     const NEG_ZERO_F32_BITS: u32 = (-0.0_f32).to_bits();
     const NEG_ZERO_F64_BITS: u64 = (-0.0_f64).to_bits();
+    const NAN_F16_BITS: u16 = half::f16::NAN.to_bits();
+    const NAN_F32_BITS: u32 = f32::NAN.to_bits();
+    const NAN_F64_BITS: u64 = f64::NAN.to_bits();
     match array.data_type() {
         DataType::Float32 => {
             let arr: &Float32Array = array.as_primitive::<Float32Type>();
-            if !arr
-                .values()
-                .iter()
-                .any(|v| v.to_bits() == NEG_ZERO_F32_BITS)
-            {
+            if !arr.values().iter().any(|v| {
+                v.to_bits() == NEG_ZERO_F32_BITS
+                    || (v.is_nan() && v.to_bits() != NAN_F32_BITS)
+            }) {
                 return Arc::clone(array);
             }
-            let normalized: Float32Array =
-                arr.unary(|v| if v.to_bits() << 1 == 0 { 0.0_f32 } else { v });
-            Arc::new(normalized)
-        }
-        DataType::Float64 => {
-            let arr: &Float64Array = array.as_primitive::<Float64Type>();
-            if !arr
-                .values()
-                .iter()
-                .any(|v| v.to_bits() == NEG_ZERO_F64_BITS)
-            {
-                return Arc::clone(array);
-            }
-            let normalized: Float64Array =
-                arr.unary(|v| if v.to_bits() << 1 == 0 { 0.0_f64 } else { v });
-            Arc::new(normalized)
-        }
-        DataType::Float16 => {
-            let arr: &Float16Array = array.as_primitive::<Float16Type>();
-            if !arr
-                .values()
-                .iter()
-                .any(|v| v.to_bits() == NEG_ZERO_F16_BITS)
-            {
-                return Arc::clone(array);
-            }
-            let normalized: Float16Array = arr.unary(|v| {
+            let canonicalized: Float32Array = arr.unary(|v| {
                 if v.to_bits() << 1 == 0 {
-                    half::f16::from_bits(0)
+                    0.0_f32
+                } else if v.is_nan() {
+                    f32::NAN
                 } else {
                     v
                 }
             });
-            Arc::new(normalized)
+            Arc::new(canonicalized)
+        }
+        DataType::Float64 => {
+            let arr: &Float64Array = array.as_primitive::<Float64Type>();
+            if !arr.values().iter().any(|v| {
+                v.to_bits() == NEG_ZERO_F64_BITS
+                    || (v.is_nan() && v.to_bits() != NAN_F64_BITS)
+            }) {
+                return Arc::clone(array);
+            }
+            let canonicalized: Float64Array = arr.unary(|v| {
+                if v.to_bits() << 1 == 0 {
+                    0.0_f64
+                } else if v.is_nan() {
+                    f64::NAN
+                } else {
+                    v
+                }
+            });
+            Arc::new(canonicalized)
+        }
+        DataType::Float16 => {
+            let arr: &Float16Array = array.as_primitive::<Float16Type>();
+            if !arr.values().iter().any(|v| {
+                v.to_bits() == NEG_ZERO_F16_BITS
+                    || (v.is_nan() && v.to_bits() != NAN_F16_BITS)
+            }) {
+                return Arc::clone(array);
+            }
+            let canonicalized: Float16Array = arr.unary(|v| {
+                if v.to_bits() << 1 == 0 {
+                    half::f16::from_bits(0)
+                } else if v.is_nan() {
+                    half::f16::NAN
+                } else {
+                    v
+                }
+            });
+            Arc::new(canonicalized)
         }
         _ => Arc::clone(array),
     }
 }
 
-/// Replace `-0.0` with `+0.0` in `Float16`, `Float32`, or `Float64` scalar
-/// values. Other variants are returned unchanged. See [`normalize_float_zero`]
-/// for context.
-pub fn normalize_float_zero_scalar(scalar: ScalarValue) -> ScalarValue {
+/// Replace `-0.0` with `+0.0` and every NaN with the canonical NaN in
+/// `Float16`, `Float32`, or `Float64` scalar values. Other variants are
+/// returned unchanged. See [`canonicalize_floats`] for context.
+pub fn canonicalize_float_scalar(scalar: ScalarValue) -> ScalarValue {
     match scalar {
         ScalarValue::Float32(Some(v)) if v.to_bits() << 1 == 0 => {
             ScalarValue::Float32(Some(0.0))
         }
+        ScalarValue::Float32(Some(v)) if v.is_nan() => {
+            ScalarValue::Float32(Some(f32::NAN))
+        }
         ScalarValue::Float64(Some(v)) if v.to_bits() << 1 == 0 => {
             ScalarValue::Float64(Some(0.0))
         }
+        ScalarValue::Float64(Some(v)) if v.is_nan() => {
+            ScalarValue::Float64(Some(f64::NAN))
+        }
         ScalarValue::Float16(Some(v)) if v.to_bits() << 1 == 0 => {
             ScalarValue::Float16(Some(half::f16::from_bits(0)))
+        }
+        ScalarValue::Float16(Some(v)) if v.is_nan() => {
+            ScalarValue::Float16(Some(half::f16::NAN))
         }
         other => other,
     }
@@ -1476,7 +1502,7 @@ mod tests {
     use arrow::{
         array::{Float64Array, Int32Array},
         buffer::NullBuffer,
-        datatypes::Int32Type,
+        datatypes::{Float64Type, Int32Type},
     };
     #[cfg(feature = "sql")]
     use sqlparser::ast::Ident;
@@ -1984,5 +2010,55 @@ mod tests {
 
         fsl_values_row_number(-1, 2).unwrap_err();
         fsl_values_row_number(-1, 0).unwrap_err();
+    }
+
+    #[test]
+    fn test_canonicalize_floats() {
+        let array: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(1.0),
+            Some(-0.0),
+            Some(f64::NAN),
+            Some(-f64::NAN),
+            None,
+        ]));
+        let canonicalized = canonicalize_floats(&array);
+        let canonicalized = canonicalized.as_primitive::<Float64Type>();
+        assert_eq!(canonicalized.value(0).to_bits(), 1.0_f64.to_bits());
+        assert_eq!(canonicalized.value(1).to_bits(), 0.0_f64.to_bits());
+        assert_eq!(canonicalized.value(2).to_bits(), f64::NAN.to_bits());
+        assert_eq!(canonicalized.value(3).to_bits(), f64::NAN.to_bits());
+        assert!(canonicalized.is_null(4));
+
+        // Already-canonical arrays are returned without copying
+        let array: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 0.0, f64::NAN]));
+        let canonicalized = canonicalize_floats(&array);
+        assert!(Arc::ptr_eq(&array, &canonicalized));
+
+        // Non-float arrays are returned unchanged
+        let array: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
+        assert!(Arc::ptr_eq(&array, &canonicalize_floats(&array)));
+    }
+
+    #[test]
+    fn test_canonicalize_float_scalar() {
+        let canonicalized =
+            canonicalize_float_scalar(ScalarValue::Float64(Some(-f64::NAN)));
+        let ScalarValue::Float64(Some(v)) = canonicalized else {
+            panic!("expected Float64, got {canonicalized:?}");
+        };
+        assert_eq!(v.to_bits(), f64::NAN.to_bits());
+
+        assert_eq!(
+            canonicalize_float_scalar(ScalarValue::Float64(Some(-0.0))),
+            ScalarValue::Float64(Some(0.0))
+        );
+        assert_eq!(
+            canonicalize_float_scalar(ScalarValue::Float64(None)),
+            ScalarValue::Float64(None)
+        );
+        assert_eq!(
+            canonicalize_float_scalar(ScalarValue::Int32(Some(1))),
+            ScalarValue::Int32(Some(1))
+        );
     }
 }
