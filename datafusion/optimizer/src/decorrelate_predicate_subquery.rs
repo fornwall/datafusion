@@ -36,8 +36,9 @@ use datafusion_expr::expr_rewriter::create_col_from_scalar_expr;
 use datafusion_expr::logical_plan::{JoinType, Subquery};
 use datafusion_expr::utils::{conjunction, expr_to_columns, split_conjunction_owned};
 use datafusion_expr::{
-    BinaryExpr, Expr, Filter, LogicalPlan, LogicalPlanBuilder, Operator, exists,
-    in_subquery, lit, not, not_exists, not_in_subquery,
+    BinaryExpr, Expr, ExprSchemable, Filter, LogicalPlan, LogicalPlanBuilder, Operator,
+    Projection, Sort, SortExpr, exists, in_subquery, lit, not, not_exists,
+    not_in_subquery,
 };
 
 use log::debug;
@@ -69,8 +70,22 @@ impl OptimizerRule for DecorrelatePredicateSubquery {
             })?
             .data;
 
-        let LogicalPlan::Filter(filter) = plan else {
-            return Ok(Transformed::no(plan));
+        let filter = match plan {
+            LogicalPlan::Filter(filter) => filter,
+            // Subquery expressions outside a filter (e.g. in a projection or a
+            // sort key) have no semi/anti join equivalent, but a mark join
+            // provides their value as the mark column.
+            LogicalPlan::Projection(projection)
+                if projection.expr.iter().any(has_subquery) =>
+            {
+                return rewrite_projection(projection, config);
+            }
+            LogicalPlan::Sort(sort)
+                if sort.expr.iter().any(|s| has_subquery(&s.expr)) =>
+            {
+                return rewrite_sort(sort, config);
+            }
+            plan => return Ok(Transformed::no(plan)),
         };
 
         if !has_subquery(&filter.predicate) {
@@ -104,7 +119,7 @@ impl OptimizerRule for DecorrelatePredicateSubquery {
                 // The subquery expression is embedded within another expression
                 SubqueryPredicate::Embedded(expr) => {
                     let (plan, expr_without_subqueries) =
-                        rewrite_inner_subqueries(cur_input, expr, config)?;
+                        rewrite_inner_subqueries(cur_input, expr, config, true)?;
                     cur_input = plan;
                     other_exprs.push(expr_without_subqueries);
                 }
@@ -135,10 +150,16 @@ impl OptimizerRule for DecorrelatePredicateSubquery {
     }
 }
 
+/// `null_equals_false` describes the position of `expr`: in a filter, a NULL
+/// predicate drops rows just like FALSE, so the two-valued mark column can
+/// stand in for the three-valued `IN`. In a value position (projection, sort
+/// key) that shortcut is only exact when neither side of the `IN` can produce
+/// a NULL; other `IN` subqueries are left in place.
 fn rewrite_inner_subqueries(
     outer: LogicalPlan,
     expr: Expr,
     config: &dyn OptimizerConfig,
+    null_equals_false: bool,
 ) -> Result<(LogicalPlan, Expr)> {
     let mut cur_input = outer;
     let alias = config.alias_generator();
@@ -159,6 +180,15 @@ fn rewrite_inner_subqueries(
             subquery: Subquery { subquery, .. },
             negated,
         }) => {
+            let may_be_null = expr.as_ref().nullable(cur_input.schema().as_ref())?
+                || subquery.schema().field(0).is_nullable();
+            if !null_equals_false && may_be_null {
+                return if negated {
+                    Ok(Transformed::no(not_in_subquery(*expr, subquery)))
+                } else {
+                    Ok(Transformed::no(in_subquery(*expr, subquery)))
+                };
+            }
             let in_predicate = subquery
                 .head_output_expr()?
                 .map_or(plan_err!("single expression required."), |output_expr| {
@@ -176,6 +206,81 @@ fn rewrite_inner_subqueries(
         _ => Ok(Transformed::no(e)),
     })?;
     Ok((cur_input, expr_without_subqueries.data))
+}
+
+/// Rewrite `IN`/`EXISTS` subquery expressions in a projection into mark joins
+/// on the projection input, replacing each expression with its mark column.
+/// Expressions whose subquery cannot be converted are left in place.
+fn rewrite_projection(
+    projection: Projection,
+    config: &dyn OptimizerConfig,
+) -> Result<Transformed<LogicalPlan>> {
+    let mut cur_input = Arc::unwrap_or_clone(projection.input);
+    let mut any_rewritten = false;
+    let mut proj_exprs = Vec::with_capacity(projection.expr.len());
+    for expr in projection.expr {
+        if !has_subquery(&expr) {
+            proj_exprs.push(expr);
+            continue;
+        }
+        let old_name = expr.schema_name().to_string();
+        let (plan, new_expr) =
+            rewrite_inner_subqueries(cur_input, expr.clone(), config, false)?;
+        cur_input = plan;
+        if new_expr == expr {
+            proj_exprs.push(expr);
+        } else {
+            any_rewritten = true;
+            // Keep the original output column name
+            if new_expr.schema_name().to_string() != old_name {
+                proj_exprs.push(new_expr.alias(old_name));
+            } else {
+                proj_exprs.push(new_expr);
+            }
+        }
+    }
+    let new_plan = LogicalPlanBuilder::from(cur_input)
+        .project(proj_exprs)?
+        .build()?;
+    Ok(Transformed::new_transformed(new_plan, any_rewritten))
+}
+
+/// Rewrite `IN`/`EXISTS` subquery expressions in sort keys into mark joins on
+/// the sort input, replacing each expression with its mark column. A final
+/// projection restores the original schema. Expressions whose subquery cannot
+/// be converted are left in place.
+fn rewrite_sort(
+    sort: Sort,
+    config: &dyn OptimizerConfig,
+) -> Result<Transformed<LogicalPlan>> {
+    let mut cur_input = Arc::unwrap_or_clone(sort.input);
+    let original_schema = cur_input.schema().columns();
+    let mut any_rewritten = false;
+    let mut sort_exprs = Vec::with_capacity(sort.expr.len());
+    for sort_expr in sort.expr {
+        if !has_subquery(&sort_expr.expr) {
+            sort_exprs.push(sort_expr);
+            continue;
+        }
+        let (plan, new_expr) =
+            rewrite_inner_subqueries(cur_input, sort_expr.expr.clone(), config, false)?;
+        cur_input = plan;
+        any_rewritten = any_rewritten || new_expr != sort_expr.expr;
+        sort_exprs.push(SortExpr::new(
+            new_expr,
+            sort_expr.asc,
+            sort_expr.nulls_first,
+        ));
+    }
+    let mut new_plan = LogicalPlanBuilder::from(cur_input)
+        .sort_with_limit(sort_exprs, sort.fetch)?
+        .build()?;
+    if new_plan.schema().fields().len() != original_schema.len() {
+        new_plan = LogicalPlanBuilder::from(new_plan)
+            .project(original_schema.into_iter().map(Expr::from))?
+            .build()?;
+    }
+    Ok(Transformed::new_transformed(new_plan, any_rewritten))
 }
 
 enum SubqueryPredicate {

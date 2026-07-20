@@ -427,9 +427,11 @@ logical_plan
 statement error DataFusion error: Error during planning: Too many columns! The subquery should only return one column: t2.t2_id, t2.t2_name
 SELECT t1_id, t1_name, t1_int, (select t2_id, t2_name FROM t2 WHERE t2.t2_id = t1.t1_int) FROM t1
 
-#subquery_not_allowed
-#In/Exist Subquery is not allowed in ORDER BY clause.
-statement error DataFusion error: Invalid \(non-executable\) plan after Analyzer\ncaused by\nError during planning: In/Exist/SetComparison subquery can only be used in Projection, Filter, TableScan, Window functions, Aggregate and Join plan nodes, but was used in \[Sort: t1.t1_int IN \(<subquery>\) ASC NULLS LAST\]
+#subquery_not_supported
+#An IN subquery with nullable sides as a sort key is not rewritten to a mark
+#join (the mark column is two-valued) and is not supported by the physical
+#planner.
+statement error DataFusion error: This feature is not implemented: Physical plan does not support logical expression InSubquery\(InSubquery \{ expr: Column\(Column \{ relation: Some\(Bare \{ table: "t1" \}\), name: "t1_int" \}\), subquery: <subquery>, negated: false \}\)
 SELECT t1_id, t1_name, t1_int FROM t1 order by t1_int in (SELECT t2_int FROM t2 WHERE t1.t1_id > t1.t1_int)
 
 #non_aggregated_correlated_scalar_subquery
@@ -2599,3 +2601,68 @@ DROP TABLE sq_count_customer;
 
 statement ok
 DROP TABLE sq_count_orders;
+
+#############
+## EXISTS/IN subqueries as values (outside a filter)
+#############
+
+statement ok
+CREATE TABLE mark_t1(id INT, val INT) AS VALUES (11, 1), (22, 2), (33, 3);
+
+statement ok
+CREATE TABLE mark_t2(id INT, val INT) AS VALUES (11, 3), (22, 1);
+
+query BBB
+SELECT EXISTS(SELECT 1) a, EXISTS(SELECT 1 WHERE false) b, NOT EXISTS(SELECT 1 WHERE false) c
+----
+true false true
+
+# Correlated EXISTS in the select list
+query IB rowsort
+SELECT id, EXISTS(SELECT 1 FROM mark_t2 WHERE mark_t2.id = mark_t1.id) FROM mark_t1
+----
+11 true
+22 true
+33 false
+
+# Correlated EXISTS with a non-equality correlation
+query IB rowsort
+SELECT id, EXISTS(SELECT 1 FROM mark_t2 WHERE mark_t2.val > mark_t1.val) FROM mark_t1
+----
+11 true
+22 true
+33 false
+
+# EXISTS embedded in another expression
+query IT rowsort
+SELECT id, CASE WHEN EXISTS(SELECT 1 FROM mark_t2 WHERE mark_t2.id = mark_t1.id) THEN 'hit' ELSE 'miss' END FROM mark_t1
+----
+11 hit
+22 hit
+33 miss
+
+# IN subquery in the select list; both sides are non-nullable
+query BB
+SELECT 2 IN (SELECT x FROM (VALUES (1), (2)) t(x)) a, 5 NOT IN (SELECT x FROM (VALUES (1), (2)) t(x)) b
+----
+true true
+
+# EXISTS and IN subqueries as sort keys
+query I
+SELECT id FROM mark_t1 ORDER BY EXISTS(SELECT 1 FROM mark_t2 WHERE mark_t2.id = mark_t1.id) DESC, id
+----
+11
+22
+33
+
+query I
+SELECT x FROM (VALUES (2), (1)) t(x) ORDER BY x IN (SELECT v FROM (VALUES (1)) s(v)), x
+----
+2
+1
+
+statement ok
+DROP TABLE mark_t1;
+
+statement ok
+DROP TABLE mark_t2;
