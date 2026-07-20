@@ -40,9 +40,9 @@ pub trait HashValue {
 
     /// Return a canonical representative whose bit pattern is identical for
     /// all values that should be grouped together. Default is the identity;
-    /// floats override this to fold `-0.0` into `+0.0` so the bit-equal
-    /// `is_eq` check used during insertion treats them as the same group.
-    /// NaN payload bits are preserved.
+    /// floats override this to fold `-0.0` into `+0.0` and every NaN into the
+    /// canonical NaN so the bit-equal `is_eq` check used during insertion
+    /// treats them as the same group.
     #[inline]
     fn canonicalize(self) -> Self
     where
@@ -86,6 +86,9 @@ macro_rules! hash_float {
 
             #[inline]
             fn canonicalize(self) -> Self {
+                if self.is_nan() {
+                    return Self::NAN;
+                }
                 let bits = self.to_bits();
                 let bits = if bits << 1 == 0 { 0 } else { bits };
                 Self::from_bits(bits)

@@ -485,6 +485,7 @@ SELECT column1 FROM test_float WHERE column2 IN (column3, column4, column5, colu
 ----
 a
 d
+e
 
 query T
 SELECT column1 FROM test_float WHERE column2 IN (column3, column4, column5, column6, 2.1, NULL, '-NaN'::double)
@@ -497,7 +498,6 @@ e
 query T
 SELECT column1 FROM test_float WHERE column2 NOT IN (column3, column4, column5, column6)
 ----
-e
 
 query T
 SELECT column1 FROM test_float WHERE column2 NOT IN (column3, column4, column5, column6, 2.1, NULL, '-NaN'::double)
@@ -512,10 +512,12 @@ query T
 SELECT column1 FROM test_float WHERE 'NaN'::double IN (column2, column2 + 1, column2 + 2, column2 + 3)
 ----
 d
+e
 
 query T
 SELECT column1 FROM test_float WHERE '-NaN'::double IN (column2, column2 + 1, column2 + 2, column2 + 3)
 ----
+d
 e
 
 query II

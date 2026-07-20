@@ -18,12 +18,13 @@
 use arrow::array::BooleanArray;
 use arrow::array::{ArrayRef, Datum, make_comparator};
 use arrow::buffer::{BooleanBuffer, NullBuffer};
+use arrow::compute::kernels::boolean::{and, not, or};
 use arrow::compute::kernels::cmp::{
     distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct,
 };
 use arrow::compute::{SortOptions, ilike, like, nilike, nlike};
 use arrow::error::ArrowError;
-use datafusion_common::utils::{normalize_float_zero, normalize_float_zero_scalar};
+use datafusion_common::utils::{canonicalize_float_scalar, canonicalize_floats};
 use datafusion_common::{Result, ScalarValue};
 use datafusion_common::{arrow_datafusion_err, assert_or_internal_err, internal_err};
 use datafusion_expr_common::columnar_value::ColumnarValue;
@@ -86,21 +87,122 @@ pub fn apply_cmp(
         };
 
         // Arrow's comparison kernels use IEEE 754 totalOrder semantics for
-        // floats, which treats `-0.0` and `+0.0` as distinct. Normalize float
-        // operands so SQL semantics (`+0.0 == -0.0`) hold. No-op for
-        // non-float types.
-        let lhs = normalize_cmp_input(lhs);
-        let rhs = normalize_cmp_input(rhs);
-        apply(&lhs, &rhs, |l, r| Ok(Arc::new(f(l, r)?)))
+        // floats, which treats `-0.0` and `+0.0` as distinct and orders NaNs
+        // relative to other values. Canonicalize float operands so
+        // `+0.0 == -0.0` holds and `IS [NOT] DISTINCT FROM` sees every NaN
+        // as one value (SQL grouping equality). No-op for non-float types.
+        let lhs = canonicalize_cmp_input(lhs);
+        let rhs = canonicalize_cmp_input(rhs);
+        if is_ieee_cmp(op) && lhs.data_type().is_floating() {
+            // The ordering comparison operators follow IEEE 754 rather than
+            // totalOrder semantics: any comparison involving NaN is false,
+            // except `!=` which is true.
+            apply(&lhs, &rhs, |l, r| {
+                let result = f(l, r)?;
+                ieee_nan_cmp_fixup(op, l, r, result)
+            })
+        } else {
+            apply(&lhs, &rhs, |l, r| Ok(Arc::new(f(l, r)?)))
+        }
     }
 }
 
-fn normalize_cmp_input(cv: &ColumnarValue) -> ColumnarValue {
+fn is_ieee_cmp(op: Operator) -> bool {
+    matches!(
+        op,
+        Operator::Eq
+            | Operator::NotEq
+            | Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq
+    )
+}
+
+fn canonicalize_cmp_input(cv: &ColumnarValue) -> ColumnarValue {
     match cv {
-        ColumnarValue::Array(a) => ColumnarValue::Array(normalize_float_zero(a)),
+        ColumnarValue::Array(a) => ColumnarValue::Array(canonicalize_floats(a)),
         ColumnarValue::Scalar(s) => {
-            ColumnarValue::Scalar(normalize_float_zero_scalar(s.clone()))
+            ColumnarValue::Scalar(canonicalize_float_scalar(s.clone()))
         }
+    }
+}
+
+/// Overrides `result` rows where either float operand is NaN with the IEEE 754
+/// comparison outcome: false for every operator except `!=`, which is true.
+/// Null rows stay null. The common case - no NaN present - returns `result`
+/// unchanged.
+fn ieee_nan_cmp_fixup(
+    op: Operator,
+    lhs: &dyn Datum,
+    rhs: &dyn Datum,
+    result: BooleanArray,
+) -> Result<ArrayRef, ArrowError> {
+    let num_rows = result.len();
+    let mask = match (nan_mask(lhs, num_rows), nan_mask(rhs, num_rows)) {
+        (None, None) => return Ok(Arc::new(result)),
+        (Some(mask), None) | (None, Some(mask)) => mask,
+        (Some(l), Some(r)) => or(&l, &r)?,
+    };
+    let fixed = if op == Operator::NotEq {
+        or(&result, &mask)?
+    } else {
+        and(&result, &not(&mask)?)?
+    };
+    Ok(Arc::new(fixed))
+}
+
+/// Returns a per-row mask of NaN values in a float [`Datum`], broadcast to
+/// `num_rows` for scalars, or `None` if the datum contains no NaN (including
+/// all non-float types).
+fn nan_mask(datum: &dyn Datum, num_rows: usize) -> Option<BooleanArray> {
+    use arrow::array::{Array, AsArray};
+    use arrow::datatypes::{DataType, Float16Type, Float32Type, Float64Type};
+
+    fn mask<T: arrow::datatypes::ArrowPrimitiveType>(
+        array: &arrow::array::PrimitiveArray<T>,
+        is_scalar: bool,
+        num_rows: usize,
+        is_nan: impl Fn(T::Native) -> bool,
+    ) -> Option<BooleanArray> {
+        if is_scalar {
+            // A null scalar makes every result row null, so no fixup is
+            // needed; a NaN scalar makes every row a NaN comparison.
+            (array.null_count() == 0 && is_nan(array.value(0)))
+                .then(|| BooleanArray::new(BooleanBuffer::new_set(num_rows), None))
+        } else {
+            // Values at null positions may hold arbitrary bits, but those
+            // result rows are already null and the boolean kernels keep them
+            // null.
+            array
+                .values()
+                .iter()
+                .any(|v| is_nan(*v))
+                .then(|| BooleanArray::from_unary(array, &is_nan))
+        }
+    }
+
+    let (array, is_scalar) = datum.get();
+    match array.data_type() {
+        DataType::Float16 => mask(
+            array.as_primitive::<Float16Type>(),
+            is_scalar,
+            num_rows,
+            |v| v.is_nan(),
+        ),
+        DataType::Float32 => mask(
+            array.as_primitive::<Float32Type>(),
+            is_scalar,
+            num_rows,
+            |v| v.is_nan(),
+        ),
+        DataType::Float64 => mask(
+            array.as_primitive::<Float64Type>(),
+            is_scalar,
+            num_rows,
+            |v| v.is_nan(),
+        ),
+        _ => None,
     }
 }
 

@@ -238,14 +238,17 @@ macro_rules! hash_float_value {
     ($(($t:ty, $i:ty)),+) => {
         $(impl HashValue for $t {
             fn hash_one<S: BuildHasher>(&self, state: &S) -> u64 {
-                // +0.0 and -0.0 differ only in the sign bit but compare equal
-                // under IEEE 754; normalize -0.0 → +0.0 so Hash agrees with Eq.
-                let bits = <$i>::from_ne_bytes(self.to_ne_bytes());
+                // `-0.0`/`+0.0` and all NaN bit patterns each form one group
+                // under SQL grouping equality; canonicalize so Hash agrees
+                // with that equality.
+                let v: $t = if self.is_nan() { <$t>::NAN } else { *self };
+                let bits = <$i>::from_ne_bytes(v.to_ne_bytes());
                 let bits = if bits << 1 == 0 { 0 } else { bits };
                 state.hash_one(bits)
             }
             fn hash_write(&self, hasher: &mut impl Hasher) {
-                let bits = <$i>::from_ne_bytes(self.to_ne_bytes());
+                let v: $t = if self.is_nan() { <$t>::NAN } else { *self };
+                let bits = <$i>::from_ne_bytes(v.to_ne_bytes());
                 let bits: $i = if bits << 1 == 0 { 0 } else { bits };
                 hasher.write(&bits.to_ne_bytes())
             }

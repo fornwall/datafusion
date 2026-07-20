@@ -31,6 +31,7 @@ use arrow::compute::kernels::boolean::{not, or_kleene};
 use arrow::compute::kernels::cmp::eq as arrow_eq;
 use arrow::datatypes::*;
 
+use datafusion_common::utils::{canonicalize_float_scalar, canonicalize_floats};
 use datafusion_common::{
     DFSchema, Result, ScalarValue, assert_or_internal_err, exec_err,
 };
@@ -361,13 +362,18 @@ impl PhysicalExpr for InListExpr {
                 // Use Arrow's vectorized eq kernel for types it supports (primitive,
                 // boolean, string, binary, dictionary), falling back to row-by-row
                 // comparator for unsupported types (nested, RunEndEncoded, etc.).
-                let value = value.into_array(num_rows)?;
+                //
+                // `IN` uses SQL grouping equality, so canonicalize floats on
+                // both sides: `-0.0`/`+0.0` and all NaN bit patterns each
+                // match as one value under the totalOrder-based kernels.
+                let value = canonicalize_floats(&value.into_array(num_rows)?);
                 let lhs_supports_arrow_eq = supports_arrow_eq(value.data_type());
 
                 // Helper: compare value against a single list expression
                 let compare_one = |expr: &Arc<dyn PhysicalExpr>| -> Result<BooleanArray> {
                     match expr.evaluate(batch)? {
                         ColumnarValue::Array(array) => {
+                            let array = canonicalize_floats(&array);
                             if lhs_supports_arrow_eq
                                 && supports_arrow_eq(array.data_type())
                             {
@@ -387,6 +393,7 @@ impl PhysicalExpr for InListExpr {
                             }
                         }
                         ColumnarValue::Scalar(scalar) => {
+                            let scalar = canonicalize_float_scalar(scalar);
                             // Check if scalar is null once, before the loop
                             if scalar.is_null() {
                                 // If scalar is null, all comparisons return null
@@ -1073,13 +1080,15 @@ mod tests {
             &schema
         );
 
+        // Grouping equality: every NaN bit pattern matches a NaN in the list
+
         // expression: "a in (0.0, 0.1, NaN)"
         let list = vec![lit(0.0f64), lit(0.1f64), lit(f64::NAN)];
         in_list!(
             batch,
             list,
             &false,
-            vec![Some(true), Some(false), None, Some(true), Some(false)],
+            vec![Some(true), Some(false), None, Some(true), Some(true)],
             Arc::clone(&col_a),
             &schema
         );
@@ -1090,7 +1099,7 @@ mod tests {
             batch,
             list,
             &true,
-            vec![Some(false), Some(true), None, Some(false), Some(true)],
+            vec![Some(false), Some(true), None, Some(false), Some(false)],
             Arc::clone(&col_a),
             &schema
         );
@@ -1101,7 +1110,7 @@ mod tests {
             batch,
             list,
             &false,
-            vec![Some(true), Some(false), None, Some(false), Some(true)],
+            vec![Some(true), Some(false), None, Some(true), Some(true)],
             Arc::clone(&col_a),
             &schema
         );
@@ -1112,7 +1121,7 @@ mod tests {
             batch,
             list,
             &true,
-            vec![Some(false), Some(true), None, Some(true), Some(false)],
+            vec![Some(false), Some(true), None, Some(false), Some(false)],
             Arc::clone(&col_a),
             &schema
         );
