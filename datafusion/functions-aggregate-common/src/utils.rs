@@ -25,7 +25,7 @@ use arrow::datatypes::{
 use datafusion_common::cast::{as_list_array, as_primitive_array};
 use datafusion_common::hash_utils::RandomState;
 use datafusion_common::utils::memory::estimate_memory_size;
-use datafusion_common::utils::{SingleRowListArrayBuilder, normalize_float_zero};
+use datafusion_common::utils::{SingleRowListArrayBuilder, canonicalize_floats};
 use datafusion_common::{
     HashSet, Result, ScalarValue, exec_err, internal_datafusion_err,
 };
@@ -232,9 +232,9 @@ impl<T: ArrowPrimitiveType> GenericDistinctBuffer<T> {
             "DistinctValuesBuffer::update_batch expects only a single input array"
         );
 
-        // Normalize -0.0 -> +0.0 so the bit-based `Hashable` set agrees with
-        // GROUP BY about zero equality.
-        let values = normalize_float_zero(&values[0]);
+        // Canonicalize ±0 and NaN bit patterns so the bit-based `Hashable`
+        // set treats each of them as one distinct value.
+        let values = canonicalize_floats(&values[0]);
         let arr = as_primitive_array::<T>(&values)?;
         if arr.null_count() > 0 {
             self.values.extend(arr.iter().flatten().map(Hashable));

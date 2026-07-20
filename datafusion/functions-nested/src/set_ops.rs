@@ -28,7 +28,7 @@ use arrow::datatypes::DataType::{LargeList, List, Null};
 use arrow::datatypes::{DataType, Field, FieldRef};
 use arrow::row::{RowConverter, SortField};
 use datafusion_common::cast::{as_large_list_array, as_list_array};
-use datafusion_common::utils::{ListCoercion, normalize_float_zero};
+use datafusion_common::utils::{ListCoercion, canonicalize_floats};
 use datafusion_common::{
     Result, assert_eq_or_internal_err, exec_err, internal_err, utils::take_function_args,
 };
@@ -351,11 +351,12 @@ fn generic_set_lists<OffsetSize: OffsetSizeTrait>(
 
     let converter = RowConverter::new(vec![SortField::new(l.value_type())])?;
 
-    // Normalize -0.0 → +0.0 so RowConverter (which uses IEEE 754 totalOrder
-    // and treats ±0 as distinct) groups them together. Use the normalized
-    // arrays for both row conversion and the final output values.
-    let l_values_norm = normalize_float_zero(l.values());
-    let r_values_norm = normalize_float_zero(r.values());
+    // Canonicalize ±0 and NaN bit patterns so RowConverter (which uses
+    // IEEE 754 totalOrder and treats them as distinct) groups each of them
+    // together. Use the canonicalized arrays for both row conversion and the
+    // final output values.
+    let l_values_norm = canonicalize_floats(l.values());
+    let r_values_norm = canonicalize_floats(r.values());
 
     // Only convert the visible portion of the values array. For sliced
     // ListArrays, values() returns the full underlying array but only
@@ -565,10 +566,10 @@ fn general_array_distinct<OffsetSize: OffsetSizeTrait>(
 
     let converter = RowConverter::new(vec![SortField::new(dt.clone())])?;
 
-    // Normalize -0.0 → +0.0 so RowConverter (which uses IEEE 754 totalOrder
-    // and treats ±0 as distinct) groups them together, and so the output
-    // carries the canonical sign.
-    let values_norm = normalize_float_zero(array.values());
+    // Canonicalize ±0 and NaN bit patterns so RowConverter (which uses
+    // IEEE 754 totalOrder and treats them as distinct) groups each of them
+    // together, and so the output carries the canonical form.
+    let values_norm = canonicalize_floats(array.values());
 
     // Only convert the visible portion of the values array. For sliced
     // ListArrays, values() returns the full underlying array but only

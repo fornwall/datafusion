@@ -66,7 +66,7 @@ use datafusion_common::cast::as_boolean_array;
 use datafusion_common::hash_utils::RandomState;
 use datafusion_common::hash_utils::create_hashes;
 use datafusion_common::stats::Precision;
-use datafusion_common::utils::normalize_float_zero;
+use datafusion_common::utils::canonicalize_floats;
 use datafusion_common::{
     DataFusionError, JoinSide, JoinType, NullEquality, Result, SharedResult,
     internal_datafusion_err, not_impl_err, plan_err,
@@ -2239,9 +2239,10 @@ fn eq_dyn_null(
         return Ok(compare_op_for_nested(op, &left, &right)?);
     }
     // Arrow's `eq` / `not_distinct` use IEEE 754 totalOrder semantics for
-    // floats, so `-0.0` and `+0.0` would compare unequal. Normalize float
-    // operands first; non-float types dispatch directly to avoid the
-    // `make_array(to_data())` round-trip.
+    // floats, so `-0.0` and `+0.0` (and NaNs with different bit patterns)
+    // would compare unequal. Canonicalize float operands first; non-float
+    // types dispatch directly to avoid the `make_array(to_data())`
+    // round-trip.
     if !matches!(
         left.data_type(),
         DataType::Float16 | DataType::Float32 | DataType::Float64
@@ -2253,8 +2254,8 @@ fn eq_dyn_null(
     }
     let left_arr: ArrayRef = make_array(left.to_data());
     let right_arr: ArrayRef = make_array(right.to_data());
-    let left_norm = normalize_float_zero(&left_arr);
-    let right_norm = normalize_float_zero(&right_arr);
+    let left_norm = canonicalize_floats(&left_arr);
+    let right_norm = canonicalize_floats(&right_arr);
     let left = left_norm.as_ref();
     let right = right_norm.as_ref();
     match null_equality {
@@ -2306,14 +2307,15 @@ impl JoinKeyComparator {
             .zip(sort_options.iter())
             .map(|((l, r), opts)| {
                 // `make_comparator` uses IEEE 754 totalOrder for floats and
-                // treats `-0.0` / `+0.0` as distinct. Normalize float arrays
-                // so SMJ / piecewise-merge equi-keys honor SQL equality;
+                // treats `-0.0` / `+0.0` and distinct NaN bit patterns as
+                // distinct. Canonicalize float arrays so SMJ /
+                // piecewise-merge equi-keys honor SQL grouping equality;
                 // no-op (Arc::clone) for non-floats and for float arrays
-                // that contain no `-0.0`. `normalize_float_zero` preserves
+                // that are already canonical. `canonicalize_floats` preserves
                 // null positions, so the original null masks below remain
                 // valid.
-                let l_norm = normalize_float_zero(l);
-                let r_norm = normalize_float_zero(r);
+                let l_norm = canonicalize_floats(l);
+                let r_norm = canonicalize_floats(r);
                 let inner = make_comparator(l_norm.as_ref(), r_norm.as_ref(), *opts)?;
                 if null_equality == NullEquality::NullEqualsNothing {
                     let ln = l.logical_nulls().filter(|n| n.null_count() > 0);

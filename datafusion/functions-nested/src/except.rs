@@ -27,7 +27,7 @@ use arrow::buffer::{NullBuffer, OffsetBuffer};
 use arrow::compute::take;
 use arrow::datatypes::{DataType, FieldRef};
 use arrow::row::{RowConverter, SortField};
-use datafusion_common::utils::{ListCoercion, normalize_float_zero, take_function_args};
+use datafusion_common::utils::{ListCoercion, canonicalize_floats, take_function_args};
 use datafusion_common::{HashSet, Result, internal_err};
 use datafusion_expr::{
     ColumnarValue, Documentation, ScalarFunctionArgs, ScalarUDFImpl, Signature,
@@ -169,10 +169,11 @@ fn general_except<OffsetSize: OffsetSizeTrait>(
 ) -> Result<GenericListArray<OffsetSize>> {
     let converter = RowConverter::new(vec![SortField::new(l.value_type())])?;
 
-    // Normalize -0.0 → +0.0 so RowConverter (IEEE 754 totalOrder) groups
-    // ±0 together for both the rhs lookup set and the lhs probe.
-    let l_values_norm = normalize_float_zero(l.values());
-    let r_values_norm = normalize_float_zero(r.values());
+    // Canonicalize ±0 and NaN bit patterns so RowConverter (IEEE 754
+    // totalOrder) groups each of them together for both the rhs lookup set
+    // and the lhs probe.
+    let l_values_norm = canonicalize_floats(l.values());
+    let r_values_norm = canonicalize_floats(r.values());
 
     // Only convert the visible portion of the values array. For sliced
     // ListArrays, values() returns the full underlying array but only

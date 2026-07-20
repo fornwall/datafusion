@@ -568,11 +568,12 @@ physical_plan
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 03)--DataSourceExec: partitions=1, partition_sizes=[1]
 
-# select NaNs
+# select NaNs. There is a single logical NaN which compares greater than
+# every number (as in PostgreSQL), so '-NaN' < 0 is false.
 query BBBB
 select (isnan('NaN'::double) AND 'NaN'::double > 0) a, (isnan('-NaN'::double) AND '-NaN'::double < 0) b, (isnan('NaN'::float) AND 'NaN'::float > 0) c, (isnan('-NaN'::float) AND '-NaN'::float < 0) d
 ----
-true true true true
+true false true false
 
 # select limit clause
 query I
