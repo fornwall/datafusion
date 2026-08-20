@@ -2082,6 +2082,23 @@ SELECT x FROM sq_main ORDER BY x + (SELECT max(v) FROM sq_values);
 10
 20
 
+# Regression coverage for https://github.com/apache/datafusion/pull/23677:
+# an ORDER BY key computed from an uncorrelated scalar subquery and dropped by
+# the final projection must still hand the global ordering requirement through
+# ScalarSubqueryExec to the main input. Keep the input unsorted so the test
+# fails if physical optimization removes the sort.
+query I
+SELECT x
+FROM (
+  SELECT x, x + (SELECT 0) AS sort_key
+  FROM UNNEST([3, 1, 2]) AS u(x)
+) AS t
+ORDER BY sort_key;
+----
+1
+2
+3
+
 # ScalarSubqueryExec should not add an extra repartition above an ordered main
 # input. The main child should be SortPreservingMergeExec directly.
 query TT
