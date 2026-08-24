@@ -20,7 +20,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use crate::decorrelate::{PullUpCorrelatedExpr, UN_MATCHED_ROW_INDICATOR};
+use crate::decorrelate::PullUpCorrelatedExpr;
 use crate::optimizer::ApplyOrder;
 use crate::utils::{evaluates_to_null, replace_qualified_name};
 use crate::{OptimizerConfig, OptimizerRule};
@@ -351,11 +351,14 @@ fn build_join(
     // join with `Boolean(true)`) when the
     // `enable_physical_uncorrelated_scalar_subquery` option is disabled.
     let subquery_plan = subquery.subquery.as_ref();
-    let mut pull_up = PullUpCorrelatedExpr::new().with_need_handle_count_bug(true);
+    let mut pull_up = PullUpCorrelatedExpr::new()
+        .with_unique_unmatched_row_indicator(subquery_plan)
+        .with_need_handle_count_bug(true);
     let decorrelated_subquery = subquery_plan.clone().rewrite(&mut pull_up).data()?;
     if !pull_up.can_pull_up {
         return Ok(None);
     }
+    let unmatched_row_indicator = pull_up.unmatched_row_indicator().to_string();
 
     let collected_count_expr_map = pull_up
         .collected_count_expr_map
@@ -414,7 +417,7 @@ fn build_join(
             }
 
             let indicator_col =
-                Column::new(Some(subquery_alias), UN_MATCHED_ROW_INDICATOR);
+                Column::new(Some(subquery_alias), &unmatched_row_indicator);
             // Qualify with the subquery alias to avoid ambiguity when the
             // outer table has a column with the same name as the aggregate.
             let value_col = Column::new(Some(subquery_alias), name);

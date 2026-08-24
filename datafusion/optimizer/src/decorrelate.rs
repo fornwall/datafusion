@@ -35,7 +35,7 @@ use datafusion_expr::utils::{
 };
 use datafusion_expr::{
     BinaryExpr, Cast, EmptyRelation, Expr, ExprSchemable, FetchType, LogicalPlan,
-    LogicalPlanBuilder, Operator, expr, lit,
+    LogicalPlanBuilder, Operator, SkipType, expr, lit,
 };
 
 /// This struct rewrite the sub query plan by pull up the correlated
@@ -74,6 +74,9 @@ pub struct PullUpCorrelatedExpr {
     /// whether we have converted a scalar aggregation into a group aggregation. When unnesting
     /// lateral joins, we need to produce a left outer join in such cases.
     pub pulled_up_scalar_agg: bool,
+    /// Collision-free column name used to identify rows produced by the right side of a
+    /// count-bug-compensated left join.
+    unmatched_row_indicator: String,
 }
 
 impl Default for PullUpCorrelatedExpr {
@@ -95,7 +98,39 @@ impl PullUpCorrelatedExpr {
             collected_count_expr_map: HashMap::new(),
             pull_up_having_expr: None,
             pulled_up_scalar_agg: false,
+            unmatched_row_indicator: UN_MATCHED_ROW_INDICATOR.to_string(),
         }
+    }
+
+    /// Select an unmatched-row indicator that does not collide with any column in `plan`.
+    pub(crate) fn with_unique_unmatched_row_indicator(
+        mut self,
+        plan: &LogicalPlan,
+    ) -> Self {
+        let mut field_names = BTreeSet::new();
+        let mut plans = vec![plan];
+        while let Some(plan) = plans.pop() {
+            field_names.extend(plan.schema().field_names());
+            plans.extend(plan.inputs());
+        }
+
+        let mut suffix = 0;
+        self.unmatched_row_indicator = loop {
+            let name = match suffix {
+                0 => UN_MATCHED_ROW_INDICATOR.to_string(),
+                suffix => format!("{UN_MATCHED_ROW_INDICATOR}_{suffix}"),
+            };
+            if !field_names.contains(&name) {
+                break name;
+            }
+            suffix += 1;
+        };
+        self
+    }
+
+    /// Return the column name used to identify matched rows during count-bug compensation.
+    pub(crate) fn unmatched_row_indicator(&self) -> &str {
+        &self.unmatched_row_indicator
     }
 
     /// Set if we need to handle [the count bug] during the pull up process
@@ -268,7 +303,7 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
                     if !expr_result_map_for_count_bug.is_empty() {
                         // has count bug
                         let un_matched_row = Expr::Column(Column::new_unqualified(
-                            UN_MATCHED_ROW_INDICATOR.to_string(),
+                            self.unmatched_row_indicator.clone(),
                         ));
                         // add the unmatched rows indicator to the Projection expressions
                         missing_exprs.push(un_matched_row);
@@ -318,7 +353,8 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
                     )?;
                     if !expr_result_map_for_count_bug.is_empty() {
                         // has count bug
-                        let un_matched_row = lit(true).alias(UN_MATCHED_ROW_INDICATOR);
+                        let un_matched_row =
+                            lit(true).alias(self.unmatched_row_indicator.clone());
                         // add the unmatched rows indicator to the Aggregation's group expressions
                         missing_exprs.push(un_matched_row);
                     }
@@ -380,19 +416,47 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
                 // handling the limit clause in the subquery
                 let new_plan = match (self.exists_sub_query, self.join_filters.is_empty())
                 {
-                    // Correlated exist subquery, remove the limit(so that correlated expressions can pull up)
-                    (true, false) => Transformed::yes(match limit.get_fetch_type()? {
-                        FetchType::Literal(Some(0)) => {
-                            LogicalPlan::EmptyRelation(EmptyRelation {
-                                produce_one_row: false,
-                                schema: Arc::clone(limit.input.schema()),
-                            })
+                    // Correlated EXISTS subquery: remove limits that cannot change
+                    // whether the input is empty, so correlated expressions can pull up.
+                    (true, false) => {
+                        match (limit.get_skip_type()?, limit.get_fetch_type()?) {
+                            (_, FetchType::Literal(Some(0))) => Transformed::yes(
+                                LogicalPlan::EmptyRelation(EmptyRelation {
+                                    produce_one_row: false,
+                                    schema: Arc::clone(limit.input.schema()),
+                                }),
+                            ),
+                            // A scalar aggregate produces at most one row before LIMIT,
+                            // so a positive offset always removes it.
+                            (SkipType::Literal(1..), FetchType::Literal(_))
+                                if input_expr_map.is_some() =>
+                            {
+                                Transformed::yes(LogicalPlan::EmptyRelation(
+                                    EmptyRelation {
+                                        produce_one_row: false,
+                                        schema: Arc::clone(limit.input.schema()),
+                                    },
+                                ))
+                            }
+                            (SkipType::Literal(0), FetchType::Literal(_)) => {
+                                Transformed::yes(
+                                    LogicalPlanBuilder::from((*limit.input).clone())
+                                        .build()?,
+                                )
+                            }
+                            _ => {
+                                self.can_pull_up = false;
+                                Transformed::no(plan)
+                            }
                         }
-                        _ => LogicalPlanBuilder::from((*limit.input).clone()).build()?,
-                    }),
+                    }
                     _ => Transformed::no(plan),
                 };
-                if let Some(input_map) = input_expr_map {
+                // An empty subquery has no row carrying an aggregate's
+                // empty-input value, so there is nothing to compensate.
+                if let Some(input_map) = input_expr_map
+                    && !matches!(new_plan.data, LogicalPlan::EmptyRelation(_))
+                {
                     self.collected_count_expr_map
                         .insert(new_plan.data.clone(), input_map);
                 }

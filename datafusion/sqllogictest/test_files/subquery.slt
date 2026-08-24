@@ -2737,3 +2737,126 @@ b 400
 
 statement ok
 DROP TABLE metrics;
+
+# Regression test for the count bug in predicate position: a correlated
+# group-by-less aggregate yields a row even when its input is empty, so the
+# outer rows matching nothing must survive the decorrelated join.
+statement ok
+CREATE TABLE cb_t1(k INT) AS VALUES (1), (2), (3);
+
+statement ok
+CREATE TABLE cb_t2(v INT) AS VALUES (1), (1), (3);
+
+#exists_subquery_count_agg_with_pull_up_having
+query TT
+explain SELECT k FROM cb_t1 WHERE EXISTS (SELECT count(*) FROM cb_t2 WHERE cb_t2.v = cb_t1.k HAVING count(*) = 0)
+----
+logical_plan
+01)Projection: cb_t1.k
+02)--Filter: __correlated_sq_1.__always_true IS NULL OR __correlated_sq_1.count(Int64(1)) = Int64(0) IS TRUE
+03)----Projection: cb_t1.k, __correlated_sq_1.count(Int64(1)), __correlated_sq_1.__always_true
+04)------Left Join: cb_t1.k = __correlated_sq_1.v
+05)--------TableScan: cb_t1 projection=[k]
+06)--------SubqueryAlias: __correlated_sq_1
+07)----------Projection: cb_t2.v, count(Int64(1)), Boolean(true) AS __always_true
+08)------------Aggregate: groupBy=[[cb_t2.v]], aggr=[[count(Int64(1))]]
+09)--------------TableScan: cb_t2 projection=[v]
+physical_plan
+01)FilterExec: __always_true@2 IS NULL OR (count(Int64(1))@1 = 0) IS NOT DISTINCT FROM true, projection=[k@0]
+02)--HashJoinExec: mode=CollectLeft, join_type=Left, on=[(k@0, v@0)], projection=[k@0, count(Int64(1))@2, __always_true@3]
+03)----DataSourceExec: partitions=1, partition_sizes=[1]
+04)----ProjectionExec: expr=[v@0 as v, count(Int64(1))@1 as count(Int64(1)), true as __always_true]
+05)------AggregateExec: mode=FinalPartitioned, gby=[v@0 as v], aggr=[count(Int64(1))]
+06)--------RepartitionExec: partitioning=Hash([v@0], 4), input_partitions=1
+07)----------AggregateExec: mode=Partial, gby=[v@0 as v], aggr=[count(Int64(1))]
+08)------------DataSourceExec: partitions=1, partition_sizes=[1]
+
+query I rowsort
+SELECT k FROM cb_t1 WHERE EXISTS (SELECT count(*) FROM cb_t2 WHERE cb_t2.v = cb_t1.k HAVING count(*) = 0)
+----
+2
+
+#the same aggregate reached through a derived table instead of HAVING
+query I rowsort
+SELECT k FROM cb_t1 WHERE EXISTS (SELECT c FROM (SELECT count(*) AS c FROM cb_t2 WHERE cb_t2.v = cb_t1.k) WHERE c = 0)
+----
+2
+
+#an aggregate that is NULL on empty input is affected the same way
+query I rowsort
+SELECT k FROM cb_t1 WHERE EXISTS (SELECT sum(v) FROM cb_t2 WHERE cb_t2.v = cb_t1.k HAVING sum(v) IS NULL)
+----
+2
+
+#exists over a bare correlated scalar aggregate is always true
+query TT
+explain SELECT k FROM cb_t1 WHERE EXISTS (SELECT count(*) FROM cb_t2 WHERE cb_t2.v = cb_t1.k)
+----
+logical_plan TableScan: cb_t1 projection=[k]
+physical_plan DataSourceExec: partitions=1, partition_sizes=[1]
+
+query I rowsort
+SELECT k FROM cb_t1 WHERE EXISTS (SELECT count(*) FROM cb_t2 WHERE cb_t2.v = cb_t1.k)
+----
+1
+2
+3
+
+#not exists keeps only the outer rows the compensated predicate rejects
+query I rowsort
+SELECT k FROM cb_t1 WHERE NOT EXISTS (SELECT count(*) FROM cb_t2 WHERE cb_t2.v = cb_t1.k HAVING count(*) = 0)
+----
+1
+3
+
+#the subquery is embedded in a disjunction, so it becomes a mark join
+query I rowsort
+SELECT k FROM cb_t1 WHERE k < 0 OR EXISTS (SELECT count(*) FROM cb_t2 WHERE cb_t2.v = cb_t1.k HAVING count(*) = 0)
+----
+2
+
+#in/not in compare against the aggregate's value on empty input
+query I rowsort
+SELECT k FROM cb_t1 WHERE 0 IN (SELECT count(*) FROM cb_t2 WHERE cb_t2.v = cb_t1.k)
+----
+2
+
+query I rowsort
+SELECT k FROM cb_t1 WHERE 0 NOT IN (SELECT count(*) FROM cb_t2 WHERE cb_t2.v = cb_t1.k)
+----
+1
+3
+
+#a HAVING that is false on empty input needs no compensation
+query I rowsort
+SELECT k FROM cb_t1 WHERE EXISTS (SELECT count(*) FROM cb_t2 WHERE cb_t2.v = cb_t1.k HAVING count(*) > 0)
+----
+1
+3
+
+#GROUP BY leaves no empty-input row to lose
+query I rowsort
+SELECT k FROM cb_t1 WHERE EXISTS (SELECT count(*) FROM cb_t2 WHERE cb_t2.v = cb_t1.k GROUP BY cb_t2.v HAVING count(*) = 0)
+----
+
+#LIMIT 0 empties the subquery, so there is no row to compensate with
+query I rowsort
+SELECT k FROM cb_t1 WHERE EXISTS (SELECT count(*) FROM cb_t2 WHERE cb_t2.v = cb_t1.k LIMIT 0)
+----
+
+#OFFSET 1 removes the scalar aggregate's sole row
+query I rowsort
+SELECT k FROM cb_t1 WHERE EXISTS (SELECT count(*) FROM cb_t2 WHERE cb_t2.v = cb_t1.k OFFSET 1)
+----
+
+#the unmatched-row indicator must not collide with a user-visible alias
+query I rowsort
+SELECT k FROM cb_t1 WHERE EXISTS (SELECT count(*) AS __always_true FROM cb_t2 WHERE cb_t2.v = cb_t1.k HAVING count(*) = 0)
+----
+2
+
+statement ok
+DROP TABLE cb_t1;
+
+statement ok
+DROP TABLE cb_t2;
