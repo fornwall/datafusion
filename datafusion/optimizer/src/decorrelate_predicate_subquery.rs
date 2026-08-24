@@ -20,7 +20,8 @@ use std::collections::BTreeSet;
 use std::ops::Deref;
 use std::sync::Arc;
 
-use crate::decorrelate::PullUpCorrelatedExpr;
+use crate::analyzer::type_coercion::TypeCoercionRewriter;
+use crate::decorrelate::{ExprResultMap, PullUpCorrelatedExpr};
 use crate::extract_equijoin_predicate::split_eq_and_noneq_join_predicate;
 use crate::optimizer::ApplyOrder;
 use crate::utils::replace_qualified_name;
@@ -30,7 +31,7 @@ use datafusion_common::alias::AliasGenerator;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{
     Column, DFSchemaRef, ExprSchema, NullEquality, Result, assert_or_internal_err,
-    plan_err,
+    internal_err, plan_err,
 };
 use datafusion_expr::expr::{Exists, InSubquery};
 use datafusion_expr::expr_rewriter::create_col_from_scalar_expr;
@@ -38,7 +39,7 @@ use datafusion_expr::logical_plan::{JoinType, Subquery};
 use datafusion_expr::utils::{conjunction, expr_to_columns, split_conjunction_owned};
 use datafusion_expr::{
     BinaryExpr, Expr, Filter, LogicalPlan, LogicalPlanBuilder, Operator, exists,
-    in_subquery, lit, not, not_exists, not_in_subquery,
+    in_subquery, lit, not, not_exists, not_in_subquery, when,
 };
 
 use log::debug;
@@ -97,7 +98,12 @@ impl OptimizerRule for DecorrelatePredicateSubquery {
                 SubqueryPredicate::Top(subquery) => {
                     match build_join_top(&subquery, &cur_input, config.alias_generator())?
                     {
-                        Some(plan) => cur_input = plan,
+                        Some((plan, expr_opt)) => {
+                            cur_input = plan;
+                            // A count bug compensated join leaves the predicate to be
+                            // evaluated on the join output.
+                            other_exprs.extend(expr_opt);
+                        }
                         // If the subquery can not be converted to a Join, reconstruct the subquery expression and add it to the Filter
                         None => other_exprs.push(subquery.expr()),
                     }
@@ -259,7 +265,7 @@ fn build_join_top(
     query_info: &SubqueryInfo,
     left: &LogicalPlan,
     alias: &Arc<AliasGenerator>,
-) -> Result<Option<LogicalPlan>> {
+) -> Result<Option<(LogicalPlan, Option<Expr>)>> {
     let where_in_expr_opt = &query_info.where_in_expr;
     let in_predicate_opt = where_in_expr_opt
         .clone()
@@ -280,13 +286,20 @@ fn build_join_top(
     };
     let subquery = query_info.query.subquery.as_ref();
     let subquery_alias = alias.next("__correlated_sq");
-    build_join(
+    Ok(build_join(
         left,
         subquery,
         in_predicate_opt.as_ref(),
         join_type,
         subquery_alias,
-    )
+    )?
+    .map(|(plan, expr_opt)| {
+        let negated = query_info.negated;
+        (
+            plan,
+            expr_opt.map(|expr| if negated { !expr } else { expr }),
+        )
+    }))
 }
 
 /// This is used to handle the case when the subquery is embedded in a more complex boolean
@@ -314,11 +327,16 @@ fn mark_join(
     let alias = alias_generator.next("__correlated_sq");
 
     let exists_col = Expr::Column(Column::new(Some(alias.clone()), "mark"));
-    let exists_expr = if negated { !exists_col } else { exists_col };
 
     Ok(
-        build_join(left, subquery, in_predicate_opt, JoinType::LeftMark, alias)?
-            .map(|plan| (plan, exists_expr)),
+        build_join(left, subquery, in_predicate_opt, JoinType::LeftMark, alias)?.map(
+            |(plan, expr_opt)| {
+                // A count bug compensated join is a left join, so the predicate
+                // replaces the mark column.
+                let expr = expr_opt.unwrap_or(exists_col);
+                (plan, if negated { !expr } else { expr })
+            },
+        ),
     )
 }
 
@@ -355,19 +373,39 @@ fn join_keys_may_be_null(
     Ok(false)
 }
 
+/// Decorrelate a predicate subquery into a join.
+///
+/// On success returns the rewritten outer plan, together with the predicate the
+/// caller must still evaluate on its output. That predicate is only produced for
+/// subqueries subject to [the count bug] (see [`build_count_bug_join`]); a plain
+/// semi/anti/mark join carries the predicate itself and returns `None`.
+///
+/// [the count bug]: https://github.com/apache/datafusion/issues/10553
 fn build_join(
     left: &LogicalPlan,
     subquery: &LogicalPlan,
     in_predicate_opt: Option<&Expr>,
     join_type: JoinType,
     alias: String,
-) -> Result<Option<LogicalPlan>> {
+) -> Result<Option<(LogicalPlan, Option<Expr>)>> {
     let mut pull_up = PullUpCorrelatedExpr::new()
+        .with_unique_unmatched_row_indicator(subquery, left, Some(&alias))
         .with_in_predicate_opt(in_predicate_opt.cloned())
-        .with_exists_sub_query(in_predicate_opt.is_none());
+        .with_exists_sub_query(in_predicate_opt.is_none())
+        .with_need_handle_count_bug(true);
 
     let new_plan = subquery.clone().rewrite(&mut pull_up).data()?;
     if !pull_up.can_pull_up {
+        return Ok(None);
+    }
+
+    let count_expr_map = pull_up.collected_count_expr_map.get(&new_plan).cloned();
+    if count_expr_map.is_none() && pull_up.pull_up_having_expr.is_some() {
+        // A filter was taken out of the subquery for the join to compensate, but
+        // the empty-input values it needs are gone -- a correlated predicate
+        // further up discarded them. Evaluating it is then no longer possible
+        // and dropping it would silently change the answer, so leave the
+        // subquery alone.
         return Ok(None);
     }
 
@@ -381,10 +419,22 @@ fn build_join(
         .for_each(|cols| all_correlated_cols.extend(cols.clone()));
 
     // alias the join filter
-    let join_filter_opt = conjunction(pull_up.join_filters)
+    let join_filter_opt = conjunction(std::mem::take(&mut pull_up.join_filters))
         .map_or(Ok(None), |filter| {
             replace_qualified_name(filter, &all_correlated_cols, &alias).map(Some)
         })?;
+
+    if let Some(count_expr_map) = count_expr_map {
+        return build_count_bug_join(
+            left,
+            sub_query_alias,
+            join_filter_opt,
+            in_predicate_opt,
+            &pull_up,
+            &count_expr_map,
+            &alias,
+        );
+    }
 
     let join_filter = match (join_filter_opt, in_predicate_opt.cloned()) {
         (
@@ -490,7 +540,7 @@ fn build_join(
             new_plan.display_indent()
         );
 
-        return Ok(Some(new_plan));
+        return Ok(Some((new_plan, None)));
     }
 
     // Determine if this should be a null-aware anti join
@@ -527,7 +577,97 @@ fn build_join(
         "predicate subquery optimized:\n{}",
         new_plan.display_indent()
     );
-    Ok(Some(new_plan))
+    Ok(Some((new_plan, None)))
+}
+
+/// Decorrelate a predicate subquery whose group-by-less aggregate is subject to
+/// [the count bug].
+///
+/// Such an aggregate yields a row even when its input is empty, but the
+/// decorrelated aggregate has no group (and so no row) for an outer row that
+/// matches nothing. A semi/anti/mark join drops exactly those outer rows, so
+/// join with a `LEFT` join instead and hand the predicate back to the caller,
+/// substituting the aggregates' empty-input values where nothing matched.
+/// A collision-free unmatched-row indicator tells the two apart.
+///
+/// [the count bug]: https://github.com/apache/datafusion/issues/10553
+fn build_count_bug_join(
+    left: &LogicalPlan,
+    sub_query_alias: LogicalPlan,
+    join_filter_opt: Option<Expr>,
+    in_predicate_opt: Option<&Expr>,
+    pull_up: &PullUpCorrelatedExpr,
+    count_expr_map: &ExprResultMap,
+    alias: &str,
+) -> Result<Option<(LogicalPlan, Option<Expr>)>> {
+    // Without a filter over it, a correlated group-by-less aggregate produces
+    // exactly one row for every outer row, so `EXISTS` over it is always true
+    // and no join is needed at all.
+    if pull_up.pull_up_having_expr.is_none() && in_predicate_opt.is_none() {
+        return Ok(Some((left.clone(), Some(lit(true)))));
+    }
+
+    let new_plan = LogicalPlanBuilder::from(left.clone())
+        .join_on(
+            sub_query_alias,
+            JoinType::Left,
+            Some(join_filter_opt.unwrap_or_else(|| lit(true))),
+        )?
+        .build()?;
+
+    let un_matched =
+        Expr::Column(Column::new(Some(alias), pull_up.unmatched_row_indicator()))
+            .is_null();
+
+    // A filter is only pulled up out of the subquery when it evaluates to true
+    // on an empty input, so an unmatched outer row passes it.
+    let having_expr = pull_up
+        .pull_up_having_expr
+        .clone()
+        .map(|having| {
+            let cols = having.column_refs().into_iter().cloned().collect();
+            replace_qualified_name(having, &cols, alias)
+                .map(|having| un_matched.clone().or(having.is_true()))
+        })
+        .transpose()?;
+
+    let in_expr = match in_predicate_opt {
+        None => None,
+        Some(Expr::BinaryExpr(BinaryExpr {
+            left: in_expr,
+            op: Operator::Eq,
+            right,
+        })) => {
+            let value_col = create_col_from_scalar_expr(right, alias.to_string())?;
+            // Every count-bug-affected output of the subquery has its empty-input
+            // value collected, so a miss means the compensation would be unsound
+            // rather than merely unknown.
+            let Some(on_empty) = count_expr_map.get(&value_col.name).cloned() else {
+                return internal_err!(
+                    "no empty-input value collected for subquery output column {}",
+                    value_col.name
+                );
+            };
+            Some(Expr::eq(
+                in_expr.deref().clone(),
+                when(un_matched, on_empty).otherwise(Expr::Column(value_col))?,
+            ))
+        }
+        Some(_) => return Ok(None),
+    };
+
+    let expr = conjunction(having_expr.into_iter().chain(in_expr))
+        .unwrap_or_else(|| lit(true))
+        .rewrite(&mut TypeCoercionRewriter {
+            schema: new_plan.schema(),
+        })
+        .data()?;
+
+    debug!(
+        "predicate subquery optimized:\n{}",
+        new_plan.display_indent()
+    );
+    Ok(Some((new_plan, Some(expr))))
 }
 
 #[derive(Debug)]
@@ -579,6 +719,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_expr::builder::table_source;
     use datafusion_expr::{and, binary_expr, col, out_ref_col, table_scan};
+    use datafusion_functions_aggregate::count::count;
 
     macro_rules! assert_optimized_plan_equal {
         (
@@ -1632,6 +1773,74 @@ mod tests {
             SubqueryAlias: __correlated_sq_1 [o_custkey:Int64]
               Projection: orders.o_custkey [o_custkey:Int64]
                 TableScan: orders [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
+        "
+        )
+    }
+
+    /// A group-by-less aggregate yields a row on empty input, so the outer rows
+    /// whose correlated group is missing must survive the join (the count bug).
+    #[test]
+    fn exists_subquery_count_agg_with_pull_up_having() -> Result<()> {
+        let count_expr = count(col("orders.o_orderkey"));
+        let count_col = Expr::Column(Column::new_unqualified(
+            count_expr.schema_name().to_string(),
+        ));
+        let sq = Arc::new(
+            LogicalPlanBuilder::from(scan_tpch_table("orders"))
+                .filter(
+                    out_ref_col(DataType::Int64, "customer.c_custkey")
+                        .eq(col("orders.o_custkey")),
+                )?
+                .aggregate(Vec::<Expr>::new(), vec![count_expr])?
+                .filter(count_col.eq(lit(0i64)))?
+                .build()?,
+        );
+
+        let plan = LogicalPlanBuilder::from(scan_tpch_table("customer"))
+            .filter(exists(sq))?
+            .project(vec![col("customer.c_custkey")])?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: customer.c_custkey [c_custkey:Int64]
+          Projection: customer.c_custkey, customer.c_name [c_custkey:Int64, c_name:Utf8]
+            Filter: __correlated_sq_1.__always_true IS NULL OR __correlated_sq_1.count(orders.o_orderkey) = Int64(0) IS TRUE [c_custkey:Int64, c_name:Utf8, o_custkey:Int64;N, __always_true:Boolean;N, count(orders.o_orderkey):Int64;N]
+              Left Join:  Filter: customer.c_custkey = __correlated_sq_1.o_custkey [c_custkey:Int64, c_name:Utf8, o_custkey:Int64;N, __always_true:Boolean;N, count(orders.o_orderkey):Int64;N]
+                TableScan: customer [c_custkey:Int64, c_name:Utf8]
+                SubqueryAlias: __correlated_sq_1 [o_custkey:Int64, __always_true:Boolean, count(orders.o_orderkey):Int64]
+                  Aggregate: groupBy=[[orders.o_custkey, Boolean(true) AS __always_true]], aggr=[[count(orders.o_orderkey)]] [o_custkey:Int64, __always_true:Boolean, count(orders.o_orderkey):Int64]
+                    TableScan: orders [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
+        "
+        )
+    }
+
+    /// Without a filter over it, such an aggregate always yields a row, so the
+    /// `EXISTS` is unconditionally true and no join is needed.
+    #[test]
+    fn exists_subquery_count_agg_always_true() -> Result<()> {
+        let sq = Arc::new(
+            LogicalPlanBuilder::from(scan_tpch_table("orders"))
+                .filter(
+                    out_ref_col(DataType::Int64, "customer.c_custkey")
+                        .eq(col("orders.o_custkey")),
+                )?
+                .aggregate(Vec::<Expr>::new(), vec![count(col("orders.o_orderkey"))])?
+                .build()?,
+        );
+
+        let plan = LogicalPlanBuilder::from(scan_tpch_table("customer"))
+            .filter(exists(sq))?
+            .project(vec![col("customer.c_custkey")])?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: customer.c_custkey [c_custkey:Int64]
+          Filter: Boolean(true) [c_custkey:Int64, c_name:Utf8]
+            TableScan: customer [c_custkey:Int64, c_name:Utf8]
         "
         )
     }

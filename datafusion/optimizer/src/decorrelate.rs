@@ -477,6 +477,18 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
                                     schema: Arc::clone(limit.input.schema()),
                                 }),
                             ),
+                            // A scalar aggregate produces at most one row before LIMIT,
+                            // so a positive offset always removes it.
+                            (SkipType::Literal(1..), FetchType::Literal(_))
+                                if input_expr_map.is_some() =>
+                            {
+                                Transformed::yes(LogicalPlan::EmptyRelation(
+                                    EmptyRelation {
+                                        produce_one_row: false,
+                                        schema: Arc::clone(limit.input.schema()),
+                                    },
+                                ))
+                            }
                             // without an offset a fetch cannot empty a non-empty input
                             (SkipType::Literal(0), FetchType::Literal(_)) => {
                                 Transformed::yes(
@@ -494,7 +506,11 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
                     }
                     _ => Transformed::no(plan),
                 };
-                if let Some(input_map) = input_expr_map {
+                // An empty subquery has no row carrying an aggregate's
+                // empty-input value, so there is nothing to compensate.
+                if let Some(input_map) = input_expr_map
+                    && !matches!(new_plan.data, LogicalPlan::EmptyRelation(_))
+                {
                     self.collected_count_expr_map
                         .insert(new_plan.data.clone(), input_map);
                 }
