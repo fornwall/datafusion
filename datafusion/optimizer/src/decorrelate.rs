@@ -295,8 +295,13 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
                         let new_plan =
                             LogicalPlanBuilder::from((*plan_filter.input).clone())
                                 .build()?;
+                        // `new_plan` is the input itself, which may already have
+                        // recorded correlated columns (a SubqueryAlias records its
+                        // re-qualified ones), so add to them rather than replace them.
                         self.correlated_subquery_cols_map
-                            .insert(new_plan.clone(), correlated_subquery_cols);
+                            .entry(new_plan.clone())
+                            .or_default()
+                            .extend(correlated_subquery_cols);
                         Ok(Transformed::yes(new_plan))
                     }
                     (None, _) => {
