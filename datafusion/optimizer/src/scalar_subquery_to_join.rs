@@ -20,7 +20,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use crate::decorrelate::PullUpCorrelatedExpr;
+use crate::decorrelate::{PullUpCorrelatedExpr, compensate_empty_input_values};
 use crate::optimizer::ApplyOrder;
 use crate::utils::{evaluates_to_null, replace_qualified_name};
 use crate::{OptimizerConfig, OptimizerRule};
@@ -31,7 +31,9 @@ use datafusion_common::tree_node::{
     Transformed, TransformedResult, TreeNode, TreeNodeRecursion, TreeNodeRewriter,
 };
 use datafusion_common::{Column, Result, ScalarValue, assert_or_internal_err, plan_err};
-use datafusion_expr::expr_rewriter::create_col_from_scalar_expr;
+use datafusion_expr::expr_rewriter::{
+    create_col_from_scalar_expr, strip_outer_reference,
+};
 use datafusion_expr::logical_plan::{JoinType, Subquery};
 use datafusion_expr::utils::conjunction;
 use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, lit, not, when};
@@ -357,6 +359,7 @@ fn build_join(
             outer_input,
             Some(subquery_alias),
         )
+        .with_pull_up_correlated_having(true)
         .with_need_handle_count_bug(true);
     let decorrelated_subquery = subquery_plan.clone().rewrite(&mut pull_up).data()?;
     if !pull_up.can_pull_up {
@@ -408,28 +411,58 @@ fn build_join(
         let mut expr_rewrite = TypeCoercionRewriter {
             schema: new_plan.schema(),
         };
-        let having_arm = pull_up
+        let indicator_col = Column::new(Some(subquery_alias), &unmatched_row_indicator);
+        let un_matched = Expr::Column(indicator_col).is_null();
+
+        // A correlated predicate over the aggregate cannot be known true on an
+        // empty input, so evaluate it over the aggregate's own empty-input
+        // values: an unmatched outer row may pass or fail it just as a matched
+        // one may.
+        let correlated_having = pull_up
             .pull_up_having_expr
             .as_ref()
-            .map(|f| (not(f.clone()), lit(ScalarValue::Null)));
+            .zip(pull_up.pull_up_having_expr_result_map.as_ref())
+            .map(|(having, expr_result_map)| -> Result<Expr> {
+                let cols: BTreeSet<Column> =
+                    having.column_refs().into_iter().cloned().collect();
+                let having =
+                    replace_qualified_name(having.clone(), &cols, subquery_alias)?;
+                let having =
+                    compensate_empty_input_values(having, &un_matched, expr_result_map)?;
+                Ok(strip_outer_reference(having).is_true())
+            })
+            .transpose()?;
+
         for (name, result) in expr_map {
-            if evaluates_to_null(result.clone(), result.column_refs())? {
+            if correlated_having.is_none()
+                && evaluates_to_null(result.clone(), result.column_refs())?
+            {
                 // Aggregates whose empty-input value is NULL (max/min/sum/…)
                 // need no compensation: the LEFT JOIN already produces NULL
-                // for unmatched outer rows.
+                // for unmatched outer rows. A correlated predicate still has to
+                // null out the rows it rejects, so it keeps its arm below.
                 continue;
             }
 
-            let indicator_col =
-                Column::new(Some(subquery_alias), &unmatched_row_indicator);
             // Qualify with the subquery alias to avoid ambiguity when the
             // outer table has a column with the same name as the aggregate.
             let value_col = Column::new(Some(subquery_alias), name);
 
-            let mut builder = when(Expr::Column(indicator_col).is_null(), result);
-            if let Some((when_expr, then_expr)) = &having_arm {
-                builder = builder.when(when_expr.clone(), then_expr.clone());
-            }
+            let mut builder = match &correlated_having {
+                // The predicate decides whether the subquery produced a row at
+                // all, so it is checked before the empty-input value stands in
+                // for an unmatched one.
+                Some(having) => when(not(having.clone()), lit(ScalarValue::Null))
+                    .when(un_matched.clone(), result),
+                None => {
+                    let mut builder = when(un_matched.clone(), result);
+                    if let Some(having) = &pull_up.pull_up_having_expr {
+                        builder =
+                            builder.when(not(having.clone()), lit(ScalarValue::Null));
+                    }
+                    builder
+                }
+            };
             let compensation_expr = builder.otherwise(Expr::Column(value_col.clone()))?;
             compensation_exprs.insert(
                 value_col,

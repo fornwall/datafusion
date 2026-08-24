@@ -21,7 +21,9 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::analyzer::type_coercion::TypeCoercionRewriter;
-use crate::decorrelate::{ExprResultMap, PullUpCorrelatedExpr};
+use crate::decorrelate::{
+    ExprResultMap, PullUpCorrelatedExpr, compensate_empty_input_values,
+};
 use crate::extract_equijoin_predicate::split_eq_and_noneq_join_predicate;
 use crate::optimizer::ApplyOrder;
 use crate::utils::replace_qualified_name;
@@ -34,7 +36,9 @@ use datafusion_common::{
     internal_err, plan_err,
 };
 use datafusion_expr::expr::{Exists, InSubquery};
-use datafusion_expr::expr_rewriter::create_col_from_scalar_expr;
+use datafusion_expr::expr_rewriter::{
+    create_col_from_scalar_expr, strip_outer_reference,
+};
 use datafusion_expr::logical_plan::{JoinType, Subquery};
 use datafusion_expr::utils::{conjunction, expr_to_columns, split_conjunction_owned};
 use datafusion_expr::{
@@ -392,6 +396,7 @@ fn build_join(
         .with_unique_unmatched_row_indicator(subquery, left, Some(&alias))
         .with_in_predicate_opt(in_predicate_opt.cloned())
         .with_exists_sub_query(in_predicate_opt.is_none())
+        .with_pull_up_correlated_having(true)
         .with_need_handle_count_bug(true);
 
     let new_plan = subquery.clone().rewrite(&mut pull_up).data()?;
@@ -619,15 +624,32 @@ fn build_count_bug_join(
         Expr::Column(Column::new(Some(alias), pull_up.unmatched_row_indicator()))
             .is_null();
 
-    // A filter is only pulled up out of the subquery when it evaluates to true
-    // on an empty input, so an unmatched outer row passes it.
     let having_expr = pull_up
         .pull_up_having_expr
         .clone()
-        .map(|having| {
-            let cols = having.column_refs().into_iter().cloned().collect();
-            replace_qualified_name(having, &cols, alias)
-                .map(|having| un_matched.clone().or(having.is_true()))
+        .map(|having| -> Result<Expr> {
+            // Only the subquery's own columns are `Expr::Column`; the outer ones
+            // it may reference are still outer references.
+            let cols: BTreeSet<Column> =
+                having.column_refs().into_iter().cloned().collect();
+            let having = replace_qualified_name(having, &cols, alias)?;
+            match &pull_up.pull_up_having_expr_result_map {
+                // A correlated predicate cannot be known true on an empty input,
+                // so evaluate it over the aggregate's empty-input values. The
+                // subquery produces a row exactly when it then holds.
+                Some(expr_result_map) => {
+                    let having = compensate_empty_input_values(
+                        having,
+                        &un_matched,
+                        expr_result_map,
+                    )?;
+                    Ok(strip_outer_reference(having).is_true())
+                }
+                // A non-correlated filter is only pulled up out of the subquery
+                // when it evaluates to true on an empty input, so an unmatched
+                // outer row passes it.
+                None => Ok(un_matched.clone().or(having.is_true())),
+            }
         })
         .transpose()?;
 

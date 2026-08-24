@@ -2864,10 +2864,9 @@ DROP TABLE ind_t1;
 statement ok
 DROP TABLE ind_t2;
 
-# A HAVING that references an outer column is pulled up into the join condition,
-# where a row it rejects is no longer distinguishable from a group that never
-# existed. The aggregate's empty-input values must therefore not be used to
-# compensate the count bug for such a subquery.
+# A HAVING that references an outer column is evaluated above the join, over the
+# aggregate's compensated values, so a row it rejects stays distinguishable from
+# a group that was never produced.
 statement ok
 CREATE TABLE corr_having_t1(k INT) AS VALUES (0), (1), (2);
 
@@ -2875,18 +2874,36 @@ statement ok
 CREATE TABLE corr_having_t2(v INT) AS VALUES (1), (1), (3);
 
 # k=1 matches two rows and 2 >= 1 holds, so the count is returned.
-# k=2 matches nothing: count(*) is 0, 0 >= 2 is false, the row is rejected and
-# the scalar subquery is NULL -- previously compensated to 0.
-# k=0 is a known-wrong remaining case of the count bug: 0 >= 0 holds, so the
-# correct answer is 0 rather than NULL. See
-# https://github.com/apache/datafusion/issues/10553
+# k=0 matches nothing: count(*) is 0 and 0 >= 0 holds, so the row survives and
+# the empty-input value is returned.
+# k=2 matches nothing either, but 0 >= 2 is false, so the row is rejected and
+# the scalar subquery is NULL.
 query II
 SELECT k, (SELECT count(*) FROM corr_having_t2 WHERE corr_having_t2.v = corr_having_t1.k HAVING count(*) >= corr_having_t1.k) AS c
 FROM corr_having_t1 ORDER BY k;
 ----
-0 NULL
+0 0
 1 2
 2 NULL
+
+# the same subquery in predicate position
+query I rowsort
+SELECT k FROM corr_having_t1 WHERE EXISTS (SELECT count(*) FROM corr_having_t2 WHERE corr_having_t2.v = corr_having_t1.k HAVING count(*) >= corr_having_t1.k);
+----
+0
+1
+
+query I rowsort
+SELECT k FROM corr_having_t1 WHERE NOT EXISTS (SELECT count(*) FROM corr_having_t2 WHERE corr_having_t2.v = corr_having_t1.k HAVING count(*) >= corr_having_t1.k);
+----
+2
+
+# a correlated HAVING that reads a column with no empty-input value keeps the
+# plain semi join, since there is nothing to compensate it with
+query I rowsort
+SELECT k FROM corr_having_t1 WHERE EXISTS (SELECT count(*) FROM corr_having_t2 WHERE corr_having_t2.v = corr_having_t1.k GROUP BY corr_having_t2.v HAVING count(*) >= corr_having_t1.k);
+----
+1
 
 statement ok
 DROP TABLE corr_having_t1;
@@ -3020,8 +3037,8 @@ SELECT k FROM cb_t1 WHERE EXISTS (SELECT count(*) FROM cb_t3 WHERE cb_t3."__alwa
 ----
 2
 
-#a correlated HAVING is applied above the aggregate, so a row it rejects must
-#not be mistaken for a missing group and compensated
+#a correlated HAVING is evaluated above the join over the compensated values, so
+#a row it rejects stays distinguishable from a group that was never produced
 query I rowsort
 SELECT k FROM cb_t1 WHERE EXISTS (SELECT count(*) FROM cb_t2 WHERE cb_t2.v = cb_t1.k HAVING count(*) >= cb_t1.k)
 ----

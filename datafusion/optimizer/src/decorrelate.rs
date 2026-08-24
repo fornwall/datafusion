@@ -36,7 +36,7 @@ use datafusion_expr::utils::{
 };
 use datafusion_expr::{
     BinaryExpr, Cast, EmptyRelation, Expr, ExprSchemable, FetchType, LogicalPlan,
-    LogicalPlanBuilder, Operator, SkipType, expr, lit,
+    LogicalPlanBuilder, Operator, SkipType, expr, lit, when,
 };
 
 /// This struct rewrite the sub query plan by pull up the correlated
@@ -72,6 +72,16 @@ pub struct PullUpCorrelatedExpr {
     pub collected_count_expr_map: HashMap<LogicalPlan, ExprResultMap>,
     /// pull up having expr, which must be evaluated after the Join
     pub pull_up_having_expr: Option<Expr>,
+    /// Whether the caller evaluates [`Self::pull_up_having_expr`] over the
+    /// count-bug-compensated values of the subquery's outputs. Only a caller
+    /// that does so can pull up a *correlated* predicate over a group-by-less
+    /// aggregate. Defaults to **FALSE**.
+    pull_up_correlated_having: bool,
+    /// Set when [`Self::pull_up_having_expr`] is such a correlated predicate,
+    /// to the empty-input values of the aggregate it sits above, named as that
+    /// expression names them. A correlated predicate holds outer references and
+    /// so, unlike a plain one, cannot be assumed true on an empty input.
+    pub pull_up_having_expr_result_map: Option<ExprResultMap>,
     /// whether we have converted a scalar aggregation into a group aggregation. When unnesting
     /// lateral joins, we need to produce a left outer join in such cases.
     pub pulled_up_scalar_agg: bool,
@@ -98,6 +108,8 @@ impl PullUpCorrelatedExpr {
             need_handle_count_bug: false,
             collected_count_expr_map: HashMap::new(),
             pull_up_having_expr: None,
+            pull_up_correlated_having: false,
+            pull_up_having_expr_result_map: None,
             pulled_up_scalar_agg: false,
             unmatched_row_indicator: UN_MATCHED_ROW_INDICATOR.to_string(),
         }
@@ -165,6 +177,17 @@ impl PullUpCorrelatedExpr {
     /// nothing else in the plan can be confused with.
     pub fn unmatched_row_indicator(&self) -> &str {
         &self.unmatched_row_indicator
+    }
+
+    /// Set if the caller evaluates the pulled up having expression over the
+    /// count-bug-compensated values of the subquery's outputs, which is what
+    /// lets a correlated predicate over a group-by-less aggregate be pulled up.
+    pub(crate) fn with_pull_up_correlated_having(
+        mut self,
+        pull_up_correlated_having: bool,
+    ) -> Self {
+        self.pull_up_correlated_having = pull_up_correlated_having;
+        self
     }
 
     /// Set if we need to handle [the count bug] during the pull up process
@@ -261,11 +284,36 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
                 }
                 let correlated_subquery_cols =
                     collect_subquery_cols(&join_filters, subquery_schema)?;
-                if !join_filters.is_empty() {
-                    // A correlated predicate above a group-by-less aggregate rejects
-                    // rows that the join can no longer tell apart from a missing
-                    // group, so the aggregate's empty-input values must not be used
-                    // to compensate the count bug.
+                // A correlated predicate above a group-by-less aggregate would be
+                // pulled up into the join condition, where a row it rejects is no
+                // longer distinguishable from a group that was never produced.
+                if !join_filters.is_empty()
+                    && let Some(expr_result_map) =
+                        self.collected_count_expr_map.get(&*plan_filter.input)
+                {
+                    // Hand the whole predicate to the caller instead, to evaluate
+                    // above the join over the aggregate's compensated values, which
+                    // needs every column it reads to have an empty-input value.
+                    let compensable = self.pull_up_correlated_having
+                        && self.pull_up_having_expr.is_none()
+                        && plan_filter
+                            .predicate
+                            .column_refs()
+                            .iter()
+                            .all(|col| expr_result_map.contains_key(&col.name));
+                    if compensable {
+                        // A projection above may rename the aggregate's outputs, so
+                        // keep the values under the names the predicate uses.
+                        let expr_result_map = expr_result_map.clone();
+                        self.pull_up_having_expr = Some(plan_filter.predicate.clone());
+                        self.pull_up_having_expr_result_map = Some(expr_result_map);
+                        return Ok(Transformed::yes(
+                            LogicalPlanBuilder::from((*plan_filter.input).clone())
+                                .build()?,
+                        ));
+                    }
+                    // Otherwise the aggregate's empty-input values must not be used
+                    // to compensate the count bug at all.
                     self.collected_count_expr_map.remove(&*plan_filter.input);
                 }
                 for expr in join_filters {
@@ -631,6 +679,32 @@ fn remove_duplicated_filter(
             }
         })
         .collect::<Vec<_>>())
+}
+
+/// Replace each output of a count-bug-compensated subquery with the value the
+/// un-decorrelated subquery would have produced for it: the expression's
+/// empty-input value wherever `un_matched` shows the left join found nothing,
+/// and the joined value otherwise.
+///
+/// The subquery's columns in `expr` must already be qualified with the join's
+/// subquery alias, so that they name the join output rather than the subquery.
+pub(crate) fn compensate_empty_input_values(
+    expr: Expr,
+    un_matched: &Expr,
+    expr_result_map: &ExprResultMap,
+) -> Result<Expr> {
+    expr.transform_up(|expr| {
+        let Expr::Column(col) = &expr else {
+            return Ok(Transformed::no(expr));
+        };
+        let Some(on_empty) = expr_result_map.get(&col.name).cloned() else {
+            return Ok(Transformed::no(expr));
+        };
+        Ok(Transformed::yes(
+            when(un_matched.clone(), on_empty).otherwise(expr)?,
+        ))
+    })
+    .data()
 }
 
 fn agg_exprs_evaluation_result_on_empty_batch(
