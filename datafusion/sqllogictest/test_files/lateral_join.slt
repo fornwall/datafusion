@@ -367,6 +367,118 @@ ORDER BY t1.id, sub.data;
 1 a y 1
 2 b z 1
 
+# The unmatched-row indicator that count-bug compensation adds must not collide
+# with a column that is already in the plan.
+statement ok
+CREATE TABLE ind_t1(k INT) AS VALUES (1), (2);
+
+statement ok
+CREATE TABLE ind_t2(v INT, "__always_true" INT) AS VALUES (1, 1), (1, 1), (3, 5);
+
+# A column of the correlated table must not collide with the indicator.
+query II
+SELECT ind_t1.k, sub.c
+FROM ind_t1, LATERAL (SELECT count(*) AS c FROM ind_t2 WHERE ind_t2."__always_true" = ind_t1.k) sub
+ORDER BY k;
+----
+1 2
+2 0
+
+# ... nor a column of the outer table, which an unaliased LATERAL subquery does
+# not shield with a qualifier.
+query II
+SELECT ind_t2.v, c
+FROM ind_t2, LATERAL (SELECT count(*) AS c FROM ind_t1 WHERE ind_t1.k = ind_t2.v)
+ORDER BY v;
+----
+1 1
+1 1
+3 0
+
+# ... nor one under a qualifier that the LATERAL subquery's own alias repeats,
+# which leaves the indicator qualified the same way.
+query II
+SELECT ind_t2.v, ind_t2.c
+FROM ind_t2, LATERAL (SELECT count(*) AS c FROM ind_t1 WHERE ind_t1.k = ind_t2.v) ind_t2
+ORDER BY 1;
+----
+1 1
+1 1
+3 0
+
+statement ok
+DROP TABLE ind_t1;
+
+statement ok
+DROP TABLE ind_t2;
+
+# The suffixed indicator must not escape into an enclosing join, whose columns
+# are outside the immediate LATERAL input used to choose its name.
+query III
+SELECT a.__always_true_1, d.k, c
+FROM (VALUES (1), (2)) a(__always_true_1),
+     (VALUES (1), (2)) d(k)
+JOIN LATERAL (
+    SELECT count(*) c
+    FROM (VALUES (1, 7)) i(k, __always_true)
+    WHERE i.k = d.k
+) ON true
+ORDER BY 1, 2;
+----
+1 1 1
+1 2 0
+2 1 1
+2 2 0
+
+# An alias does not shield the indicator from an unqualified enclosing column.
+# LEFT JOIN's ON condition must still see the compensated count.
+query III
+SELECT __always_true_1, d.k, sub.c
+FROM (SELECT 42 AS __always_true_1),
+     (VALUES (1), (2)) d(k)
+LEFT JOIN LATERAL (
+    SELECT count(*) c
+    FROM (VALUES (1, 7)) i(k, __always_true)
+    WHERE i.k = d.k
+) sub ON sub.c = 0
+ORDER BY 2;
+----
+42 1 NULL
+42 2 0
+
+# Aggregates with NULL defaults also add an internal indicator. Keep a user's
+# qualified column with the same name while removing the subquery's indicator.
+query IIII
+SELECT a.__always_true_1, d.__always_true_1, d.k, a.s
+FROM (VALUES (42)) a(__always_true_1),
+     (VALUES (99, 1), (88, 2)) d(__always_true_1, k)
+JOIN LATERAL (
+    SELECT sum(i.k) s
+    FROM (VALUES (1, 7)) i(k, __always_true)
+    WHERE i.k = d.k
+) a ON true
+ORDER BY d.k;
+----
+42 99 1 1
+42 88 2 NULL
+
+# Multiple unaliased LATERAL subqueries may independently choose the same marker.
+query III
+SELECT d.k, c, n
+FROM (VALUES (1), (2)) d(k),
+LATERAL (
+    SELECT count(*) c FROM (VALUES (1, 7)) i(k, __always_true)
+    WHERE i.k = d.k
+),
+LATERAL (
+    SELECT count(*) n FROM (VALUES (1, 8)) j(k, __always_true)
+    WHERE j.k = d.k
+)
+ORDER BY 1;
+----
+1 1 1
+2 0 0
+
 ###########################################################
 # Section 3: LEFT JOIN LATERAL
 #
