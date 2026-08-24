@@ -261,6 +261,13 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
                 }
                 let correlated_subquery_cols =
                     collect_subquery_cols(&join_filters, subquery_schema)?;
+                if !join_filters.is_empty() {
+                    // A correlated predicate above a group-by-less aggregate rejects
+                    // rows that the join can no longer tell apart from a missing
+                    // group, so the aggregate's empty-input values must not be used
+                    // to compensate the count bug.
+                    self.collected_count_expr_map.remove(&*plan_filter.input);
+                }
                 for expr in join_filters {
                     if !self.join_filters.contains(&expr) {
                         self.join_filters.push(expr)
