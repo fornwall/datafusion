@@ -35,7 +35,7 @@ use datafusion_expr::utils::{
 };
 use datafusion_expr::{
     BinaryExpr, Cast, EmptyRelation, Expr, ExprSchemable, FetchType, LogicalPlan,
-    LogicalPlanBuilder, Operator, expr, lit,
+    LogicalPlanBuilder, Operator, SkipType, expr, lit,
 };
 
 /// This struct rewrite the sub query plan by pull up the correlated
@@ -380,16 +380,32 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
                 // handling the limit clause in the subquery
                 let new_plan = match (self.exists_sub_query, self.join_filters.is_empty())
                 {
-                    // Correlated exist subquery, remove the limit(so that correlated expressions can pull up)
-                    (true, false) => Transformed::yes(match limit.get_fetch_type()? {
-                        FetchType::Literal(Some(0)) => {
-                            LogicalPlan::EmptyRelation(EmptyRelation {
-                                produce_one_row: false,
-                                schema: Arc::clone(limit.input.schema()),
-                            })
+                    // The limit must go for the correlated filters below it to pull up. For
+                    // EXISTS that is only safe if it cannot change whether the result is empty.
+                    (true, false) => {
+                        match (limit.get_skip_type()?, limit.get_fetch_type()?) {
+                            // `LIMIT 0` is always empty, whatever the offset
+                            (_, FetchType::Literal(Some(0))) => Transformed::yes(
+                                LogicalPlan::EmptyRelation(EmptyRelation {
+                                    produce_one_row: false,
+                                    schema: Arc::clone(limit.input.schema()),
+                                }),
+                            ),
+                            // without an offset a fetch cannot empty a non-empty input
+                            (SkipType::Literal(0), FetchType::Literal(_)) => {
+                                Transformed::yes(
+                                    LogicalPlanBuilder::from((*limit.input).clone())
+                                        .build()?,
+                                )
+                            }
+                            // a positive or non-literal offset, or a non-literal fetch,
+                            // might empty it
+                            _ => {
+                                self.can_pull_up = false;
+                                Transformed::no(plan)
+                            }
                         }
-                        _ => LogicalPlanBuilder::from((*limit.input).clone()).build()?,
-                    }),
+                    }
                     _ => Transformed::no(plan),
                 };
                 if let Some(input_map) = input_expr_map {
