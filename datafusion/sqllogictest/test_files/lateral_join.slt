@@ -367,6 +367,51 @@ ORDER BY t1.id, sub.data;
 1 a y 1
 2 b z 1
 
+# The unmatched-row indicator that count-bug compensation adds must not collide
+# with a column that is already in the plan.
+statement ok
+CREATE TABLE ind_t1(k INT) AS VALUES (1), (2);
+
+statement ok
+CREATE TABLE ind_t2(v INT, "__always_true" INT) AS VALUES (1, 1), (1, 1), (3, 5);
+
+# A column of the correlated table must not collide with the indicator.
+query II
+SELECT ind_t1.k, sub.c
+FROM ind_t1, LATERAL (SELECT count(*) AS c FROM ind_t2 WHERE ind_t2."__always_true" = ind_t1.k) sub
+ORDER BY k;
+----
+1 2
+2 0
+
+# ... nor a column of the outer table, which an unaliased LATERAL subquery does
+# not shield with a qualifier.
+query II
+SELECT ind_t2.v, c
+FROM ind_t2, LATERAL (SELECT count(*) AS c FROM ind_t1 WHERE ind_t1.k = ind_t2.v)
+ORDER BY v;
+----
+1 1
+1 1
+3 0
+
+# ... nor one under a qualifier that the LATERAL subquery's own alias repeats,
+# which leaves the indicator qualified the same way.
+query II
+SELECT ind_t2.v, ind_t2.c
+FROM ind_t2, LATERAL (SELECT count(*) AS c FROM ind_t1 WHERE ind_t1.k = ind_t2.v) ind_t2
+ORDER BY 1;
+----
+1 1
+1 1
+3 0
+
+statement ok
+DROP TABLE ind_t1;
+
+statement ok
+DROP TABLE ind_t2;
+
 ###########################################################
 # Section 3: LEFT JOIN LATERAL
 #

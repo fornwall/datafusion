@@ -26,7 +26,8 @@ use datafusion_common::tree_node::{
     Transformed, TransformedResult, TreeNode, TreeNodeRecursion, TreeNodeRewriter,
 };
 use datafusion_common::{
-    Column, DFSchemaRef, HashMap, Result, ScalarValue, assert_or_internal_err, plan_err,
+    Column, DFSchemaRef, HashMap, HashSet, Result, ScalarValue, assert_or_internal_err,
+    plan_err,
 };
 use datafusion_expr::expr::Alias;
 use datafusion_expr::simplify::SimplifyContext;
@@ -74,6 +75,9 @@ pub struct PullUpCorrelatedExpr {
     /// whether we have converted a scalar aggregation into a group aggregation. When unnesting
     /// lateral joins, we need to produce a left outer join in such cases.
     pub pulled_up_scalar_agg: bool,
+    /// Column marking the rows the subquery produced: [`UN_MATCHED_ROW_INDICATOR`]
+    /// unless that name is taken.
+    unmatched_row_indicator: String,
 }
 
 impl Default for PullUpCorrelatedExpr {
@@ -95,7 +99,72 @@ impl PullUpCorrelatedExpr {
             collected_count_expr_map: HashMap::new(),
             pull_up_having_expr: None,
             pulled_up_scalar_agg: false,
+            unmatched_row_indicator: UN_MATCHED_ROW_INDICATOR.to_string(),
         }
+    }
+
+    /// Pick an indicator that no column of `subquery_plan`, or of the `outer_plan`
+    /// it is joined onto, can be confused with.
+    ///
+    /// `subquery_alias`, when the decorrelated subquery gets one, qualifies the
+    /// indicator in the join output, leaving only the outer columns that are
+    /// unqualified, or that carry that same alias, able to clash with it.
+    ///
+    /// Call this before rewriting `subquery_plan`, and read the name back with
+    /// [`Self::unmatched_row_indicator`].
+    pub fn with_unique_unmatched_row_indicator(
+        mut self,
+        subquery_plan: &LogicalPlan,
+        outer_plan: &LogicalPlan,
+        subquery_alias: Option<&str>,
+    ) -> Self {
+        let mut taken_column_names = HashSet::new();
+        let mut plans = vec![subquery_plan];
+        while let Some(plan) = plans.pop() {
+            // The indicator is added unqualified, so a qualified field of the
+            // same name collides with it just as an unqualified one does.
+            taken_column_names
+                .extend(plan.schema().fields().iter().map(|f| f.name().as_str()));
+            plans.extend(plan.inputs());
+        }
+        // Only the outer plan's own output takes part in the join, so its inputs
+        // cannot clash.
+        taken_column_names.extend(
+            outer_plan
+                .schema()
+                .iter()
+                .filter(|(qualifier, _)| match (subquery_alias, qualifier) {
+                    // A subquery alias qualifies the indicator, so an outer
+                    // column under a different qualifier is already separated
+                    // from it. One under the alias itself is not.
+                    (Some(alias), Some(qualifier)) => qualifier.table() == alias,
+                    _ => true,
+                })
+                .map(|(_, field)| field.name().as_str()),
+        );
+
+        let mut suffix = 0;
+        self.unmatched_row_indicator = loop {
+            let name = if suffix == 0 {
+                UN_MATCHED_ROW_INDICATOR.to_string()
+            } else {
+                format!("{UN_MATCHED_ROW_INDICATOR}_{suffix}")
+            };
+            if !taken_column_names.contains(name.as_str()) {
+                break name;
+            }
+            suffix += 1;
+        };
+        self
+    }
+
+    /// The name picked for the unmatched-row indicator, to build the column
+    /// reference that count-bug compensation tests for NULL. Defaults to
+    /// [`UN_MATCHED_ROW_INDICATOR`] unless
+    /// [`Self::with_unique_unmatched_row_indicator`] was asked for a name that
+    /// nothing else in the plan can be confused with.
+    pub fn unmatched_row_indicator(&self) -> &str {
+        &self.unmatched_row_indicator
     }
 
     /// Set if we need to handle [the count bug] during the pull up process
@@ -119,8 +188,10 @@ impl PullUpCorrelatedExpr {
     }
 }
 
-/// Used to indicate the unmatched rows from the inner(subquery) table after the left out Join
-/// This is used to handle [the Count bug]
+/// Preferred name of the column indicating the unmatched rows from the inner(subquery)
+/// table after the left out Join. This is used to handle [the Count bug]. When the name
+/// is already taken, a suffixed variant is used instead, see
+/// [`PullUpCorrelatedExpr::with_unique_unmatched_row_indicator`].
 ///
 /// [the Count bug]: https://github.com/apache/datafusion/issues/10553
 pub const UN_MATCHED_ROW_INDICATOR: &str = "__always_true";
@@ -268,7 +339,7 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
                     if !expr_result_map_for_count_bug.is_empty() {
                         // has count bug
                         let un_matched_row = Expr::Column(Column::new_unqualified(
-                            UN_MATCHED_ROW_INDICATOR.to_string(),
+                            &self.unmatched_row_indicator,
                         ));
                         // add the unmatched rows indicator to the Projection expressions
                         missing_exprs.push(un_matched_row);
@@ -318,7 +389,8 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
                     )?;
                     if !expr_result_map_for_count_bug.is_empty() {
                         // has count bug
-                        let un_matched_row = lit(true).alias(UN_MATCHED_ROW_INDICATOR);
+                        let un_matched_row =
+                            lit(true).alias(&self.unmatched_row_indicator);
                         // add the unmatched rows indicator to the Aggregation's group expressions
                         missing_exprs.push(un_matched_row);
                     }
@@ -651,4 +723,91 @@ fn filter_exprs_evaluation_result_on_empty_batch(
         None
     };
     Ok(pull_up_expr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A plan whose only column is the unqualified `name`.
+    fn plan_with_column(name: &str) -> Result<LogicalPlan> {
+        LogicalPlanBuilder::empty(true)
+            .project(vec![lit(true).alias(name)])?
+            .build()
+    }
+
+    /// A plan whose only column is `name`, qualified by `qualifier`.
+    fn plan_with_qualified_column(qualifier: &str, name: &str) -> Result<LogicalPlan> {
+        LogicalPlanBuilder::from(plan_with_column(name)?)
+            .alias(qualifier)?
+            .build()
+    }
+
+    #[test]
+    fn unmatched_row_indicator_avoids_taken_names() -> Result<()> {
+        let free = plan_with_column("unrelated")?;
+        let taken = plan_with_column(UN_MATCHED_ROW_INDICATOR)?;
+        let also_taken = plan_with_column(&format!("{UN_MATCHED_ROW_INDICATOR}_1"))?;
+
+        // Nothing in the way: the preferred name is kept.
+        let pull_up = PullUpCorrelatedExpr::new().with_unique_unmatched_row_indicator(
+            &free,
+            &free,
+            Some("__scalar_sq_1"),
+        );
+        assert_eq!(pull_up.unmatched_row_indicator(), UN_MATCHED_ROW_INDICATOR);
+
+        // The suffix keeps rising for as long as the name it picks is taken as
+        // well, whether the clash comes from the subquery or from the outer plan.
+        let pull_up = PullUpCorrelatedExpr::new().with_unique_unmatched_row_indicator(
+            &taken,
+            &also_taken,
+            Some("__scalar_sq_1"),
+        );
+        assert_eq!(
+            pull_up.unmatched_row_indicator(),
+            format!("{UN_MATCHED_ROW_INDICATOR}_2")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn unmatched_row_indicator_avoids_outer_columns_sharing_its_qualifier() -> Result<()>
+    {
+        let free = plan_with_column("unrelated")?;
+        let outer = plan_with_qualified_column("t", UN_MATCHED_ROW_INDICATOR)?;
+
+        // The subquery alias qualifies the indicator, so an outer column under
+        // another qualifier is already separated from it.
+        let pull_up = PullUpCorrelatedExpr::new().with_unique_unmatched_row_indicator(
+            &free,
+            &outer,
+            Some("__scalar_sq_1"),
+        );
+        assert_eq!(pull_up.unmatched_row_indicator(), UN_MATCHED_ROW_INDICATOR);
+
+        // An outer column under the alias itself, on the other hand, ends up
+        // with the indicator's own qualifier.
+        let pull_up = PullUpCorrelatedExpr::new().with_unique_unmatched_row_indicator(
+            &free,
+            &outer,
+            Some("t"),
+        );
+        assert_eq!(
+            pull_up.unmatched_row_indicator(),
+            format!("{UN_MATCHED_ROW_INDICATOR}_1")
+        );
+
+        // Without an alias the indicator stays unqualified, and an unqualified
+        // name is ambiguous against a qualified one of the same name.
+        let pull_up = PullUpCorrelatedExpr::new()
+            .with_unique_unmatched_row_indicator(&free, &outer, None);
+        assert_eq!(
+            pull_up.unmatched_row_indicator(),
+            format!("{UN_MATCHED_ROW_INDICATOR}_1")
+        );
+
+        Ok(())
+    }
 }

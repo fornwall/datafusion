@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use crate::decorrelate::{PullUpCorrelatedExpr, UN_MATCHED_ROW_INDICATOR};
+use crate::decorrelate::PullUpCorrelatedExpr;
 use crate::optimizer::ApplyOrder;
 use crate::utils::evaluates_to_null;
 use crate::{OptimizerConfig, OptimizerRule};
@@ -107,11 +107,18 @@ fn rewrite_internal(join: Join) -> Result<Transformed<LogicalPlan>> {
     // Walk the subquery plan bottom-up, extracting correlated filter
     // predicates into join conditions and converting ungrouped aggregates
     // into group-by aggregates keyed on the correlation columns.
-    let mut pull_up = PullUpCorrelatedExpr::new().with_need_handle_count_bug(true);
+    let mut pull_up = PullUpCorrelatedExpr::new()
+        .with_unique_unmatched_row_indicator(
+            subquery_plan,
+            &join.left,
+            alias.as_ref().map(|a| a.table()),
+        )
+        .with_need_handle_count_bug(true);
     let rewritten_subquery = subquery_plan.clone().rewrite(&mut pull_up).data()?;
     if !pull_up.can_pull_up {
         return Ok(Transformed::no(LogicalPlan::Join(join)));
     }
+    let unmatched_row_indicator = pull_up.unmatched_row_indicator().to_string();
 
     // TODO: support HAVING in lateral subqueries.
     // <https://github.com/apache/datafusion/issues/21198>
@@ -231,8 +238,8 @@ fn rewrite_internal(join: Join) -> Result<Transformed<LogicalPlan>> {
     // Handle the count bug: in the rewritten left join, unmatched outer
     // rows get NULLs for all right-side columns. But some aggregates
     // have non-NULL defaults on empty input (e.g., COUNT returns 0, not
-    // NULL). Add a projection that wraps those columns:
-    //   CASE WHEN __always_true IS NULL THEN <default> ELSE <column> END
+    // NULL). Add a projection that wraps those columns in a CASE that
+    // substitutes the default when the unmatched-row indicator is NULL.
     let new_plan = if let Some(expr_map) = collected_count_expr_map {
         let join_schema = new_plan.schema();
         let alias_qualifier = alias.as_ref();
@@ -251,7 +258,7 @@ fn rewrite_internal(join: Join) -> Result<Transformed<LogicalPlan>> {
                 // Column whose aggregate doesn't naturally return NULL
                 // on empty input (e.g., COUNT returns 0). Wrap it.
                 let indicator_col =
-                    Column::new(alias_qualifier.cloned(), UN_MATCHED_ROW_INDICATOR);
+                    Column::new(alias_qualifier.cloned(), &unmatched_row_indicator);
                 let case_expr = Expr::Case(expr::Case {
                     expr: None,
                     when_then_expr: vec![(
