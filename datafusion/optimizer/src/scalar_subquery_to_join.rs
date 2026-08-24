@@ -20,7 +20,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use crate::decorrelate::{PullUpCorrelatedExpr, UN_MATCHED_ROW_INDICATOR};
+use crate::decorrelate::PullUpCorrelatedExpr;
 use crate::optimizer::ApplyOrder;
 use crate::utils::{evaluates_to_null, replace_qualified_name};
 use crate::{OptimizerConfig, OptimizerRule};
@@ -339,9 +339,9 @@ impl TreeNodeRewriter for ExtractScalarSubQuery<'_> {
 ///
 /// Returns `Ok(None)` if the subquery cannot be decorrelated. On success,
 /// returns the rewritten outer plan and a map from each count-bug-affected
-/// column to its `CASE WHEN __always_true IS NULL THEN ... END` compensation
-/// expression, which the caller must substitute into any expression that
-/// references those columns.
+/// column to its `CASE WHEN <unmatched row indicator> IS NULL THEN ... END`
+/// compensation expression, which the caller must substitute into any
+/// expression that references those columns.
 fn build_join(
     subquery: &Subquery,
     outer_input: &LogicalPlan,
@@ -351,11 +351,18 @@ fn build_join(
     // join with `Boolean(true)`) when the
     // `enable_physical_uncorrelated_scalar_subquery` option is disabled.
     let subquery_plan = subquery.subquery.as_ref();
-    let mut pull_up = PullUpCorrelatedExpr::new().with_need_handle_count_bug(true);
+    let mut pull_up = PullUpCorrelatedExpr::new()
+        .with_unique_unmatched_row_indicator(
+            subquery_plan,
+            outer_input,
+            Some(subquery_alias),
+        )
+        .with_need_handle_count_bug(true);
     let decorrelated_subquery = subquery_plan.clone().rewrite(&mut pull_up).data()?;
     if !pull_up.can_pull_up {
         return Ok(None);
     }
+    let unmatched_row_indicator = pull_up.unmatched_row_indicator().to_string();
 
     let collected_count_expr_map = pull_up
         .collected_count_expr_map
@@ -414,7 +421,7 @@ fn build_join(
             }
 
             let indicator_col =
-                Column::new(Some(subquery_alias), UN_MATCHED_ROW_INDICATOR);
+                Column::new(Some(subquery_alias), &unmatched_row_indicator);
             // Qualify with the subquery alias to avoid ambiguity when the
             // outer table has a column with the same name as the aggregate.
             let value_col = Column::new(Some(subquery_alias), name);
