@@ -1028,3 +1028,16 @@ RESET datafusion.catalog.information_schema;
 
 statement ok
 drop table t;
+
+
+# IN treats -0.0 and +0.0 as equal, like `=`, on both the constant-list and
+# non-constant-list paths
+query BBB
+SELECT 0.0 IN (-0.0), -0.0 IN (0.0, 1.0), 0.0 IN (1.0, x) FROM (VALUES (-0.0)) t(x)
+----
+true true true
+
+query II
+SELECT COUNT(DISTINCT x), COUNT(x) FROM (VALUES (0.0), (-0.0)) t(x)
+----
+1 2
