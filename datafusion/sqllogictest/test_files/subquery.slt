@@ -2737,3 +2737,97 @@ b 400
 
 statement ok
 DROP TABLE metrics;
+
+# The unmatched-row indicator that count-bug compensation adds must not collide
+# with a column of the correlated table, which otherwise makes the decorrelated
+# plan's schema ambiguous.
+statement ok
+CREATE TABLE ind_t1(k INT) AS VALUES (1), (2);
+
+statement ok
+CREATE TABLE ind_t2(v INT, "__always_true" INT) AS VALUES (1, 1), (1, 1);
+
+statement ok
+CREATE TABLE ind_t3(v INT, "__always_true" INT, "__always_true_1" INT) AS VALUES (1, 1, 1);
+
+# Named after the alias the rule gives the decorrelated subquery, so that the
+# indicator and this table's own column end up under the same qualifier.
+statement ok
+CREATE TABLE "__scalar_sq_1"(j INT, "__always_true" INT) AS VALUES (1, 1), (3, 3);
+
+query II
+SELECT k, (SELECT count(*) FROM ind_t2 WHERE ind_t2."__always_true" = ind_t1.k) AS c
+FROM ind_t1 ORDER BY k;
+----
+1 2
+2 0
+
+# ... nor with a user-visible alias in the subquery itself
+query II
+SELECT k, (SELECT count(*) AS "__always_true" FROM ind_t2 WHERE ind_t2.v = ind_t1.k) AS c
+FROM ind_t1 ORDER BY k;
+----
+1 2
+2 0
+
+# ... nor with an unqualified column of the outer plan
+query III
+SELECT k, "__always_true", (SELECT count(*) FROM ind_t2 WHERE ind_t2.v = k) AS c
+FROM (SELECT k, k + 1 AS "__always_true" FROM ind_t1) ORDER BY k;
+----
+1 2 2
+2 3 0
+
+# ... nor with a qualified one that shares its qualifier with the subquery alias
+query II
+SELECT j, (SELECT count(*) FROM ind_t1 WHERE ind_t1.k = "__scalar_sq_1".j) AS c
+FROM "__scalar_sq_1" ORDER BY j;
+----
+1 1
+3 0
+
+# The indicator takes a suffix to get out of the way, and keeps raising it for as
+# long as the name it picks is taken as well.
+statement ok
+set datafusion.explain.logical_plan_only = true;
+
+query TT
+EXPLAIN SELECT k, (SELECT count(*) FROM ind_t2 WHERE ind_t2."__always_true" = ind_t1.k) AS c
+FROM ind_t1;
+----
+logical_plan
+01)Projection: ind_t1.k, CASE WHEN __scalar_sq_1.__always_true_1 IS NULL THEN Int64(0) ELSE __scalar_sq_1.count(*) END AS c
+02)--Left Join: ind_t1.k = __scalar_sq_1.__always_true
+03)----TableScan: ind_t1 projection=[k]
+04)----SubqueryAlias: __scalar_sq_1
+05)------Projection: count(Int64(1)) AS count(*), ind_t2.__always_true, Boolean(true) AS __always_true_1
+06)--------Aggregate: groupBy=[[ind_t2.__always_true]], aggr=[[count(Int64(1))]]
+07)----------TableScan: ind_t2 projection=[__always_true]
+
+query TT
+EXPLAIN SELECT k, (SELECT count(*) FROM ind_t3 WHERE ind_t3."__always_true" = ind_t1.k) AS c
+FROM ind_t1;
+----
+logical_plan
+01)Projection: ind_t1.k, CASE WHEN __scalar_sq_1.__always_true_2 IS NULL THEN Int64(0) ELSE __scalar_sq_1.count(*) END AS c
+02)--Left Join: ind_t1.k = __scalar_sq_1.__always_true
+03)----TableScan: ind_t1 projection=[k]
+04)----SubqueryAlias: __scalar_sq_1
+05)------Projection: count(Int64(1)) AS count(*), ind_t3.__always_true, Boolean(true) AS __always_true_2
+06)--------Aggregate: groupBy=[[ind_t3.__always_true]], aggr=[[count(Int64(1))]]
+07)----------TableScan: ind_t3 projection=[__always_true]
+
+statement ok
+RESET datafusion.explain.logical_plan_only;
+
+statement ok
+DROP TABLE ind_t3;
+
+statement ok
+DROP TABLE "__scalar_sq_1";
+
+statement ok
+DROP TABLE ind_t1;
+
+statement ok
+DROP TABLE ind_t2;
