@@ -1727,3 +1727,33 @@ order by 1, 2;
 
 statement ok
 drop table test;
+
+# The recursive term runs at least once even when the static term produces no
+# rows: it may produce rows from an empty work table. Recursion ends when an
+# executed recursive term produces no rows.
+query I
+WITH RECURSIVE t(x) AS (
+    SELECT 1 WHERE false
+    UNION ALL
+    SELECT 1 FROM (SELECT count(*) AS c FROM t) WHERE c = 0
+) SELECT * FROM t;
+----
+1
+
+query I
+WITH RECURSIVE t(x) AS (
+    SELECT 1 WHERE false
+    UNION ALL
+    SELECT v.a FROM (VALUES (1)) v(a) LEFT JOIN t ON true WHERE t.x IS NULL
+) SELECT * FROM t;
+----
+1
+
+# An empty static term with an ordinary recursive term still produces no rows
+query I
+WITH RECURSIVE t(x) AS (
+    SELECT 1 WHERE false
+    UNION ALL
+    SELECT x + 1 FROM t WHERE x < 4
+) SELECT * FROM t;
+----
